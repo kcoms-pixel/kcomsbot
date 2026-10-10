@@ -1,30 +1,20 @@
 import os
-import time
 import requests
-from flask import Flask
-import threading
-
-# --- 1. FAKE WEBSITE FOR RENDER FREE ---
-app = Flask('')
-@app.route('/')
-def home():
-    return "KCOMS BOT V6 - LIVE!"
-
-def run_web():
-    app.run(host='0.0.0.0', port=10000)
-
-threading.Thread(target=run_web).start()
-# --------------------------------------
 
 # --- 2. YOUR TELEGRAM CONFIG ---
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
+BOT_TOKEN = "8834684274:AAE2vGC7TruiUV_YNNuaky5AMqOtoSMm4OU"
+CHAT_ID = "498798769"
 
 def send_telegram(msg):
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=10)
-        print("Telegram sent!")
+        resp = requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=10)
+        data = resp.json()
+        if data.get("ok"):
+            print("Telegram sent!")
+        else:
+            print(f"Telegram FAILED: {data} - Check CHAT_ID / BOT_TOKEN")
+            print(f"Using CHAT_ID={CHAT_ID}")
     except Exception as e:
         print(f"Telegram error: {e}")
 
@@ -36,24 +26,5 @@ losses = 0
 total_pnl = 0.0
 active_trade = None
 
-def get_price():
-    try:
-        url = "https://api.kraken.com/0/public/Ticker?pair=BTCUSD"
-        r = requests.get(url, timeout=15).json()
-        price = float(r['result']['XXBTZUSD']['c'][0])
-        print(f"Got price: {price}")
-        return price
-    except Exception as e:
-        print(f"Price error: {e}")
-        return None
-
-# --- 3. YOUR MAIN LOOP (Add your strategy below) ---
-while True:
-    price = get_price()
-
-    # YOUR TRADING LOGIC HERE
-    # Example:
-    # if price and active_trade is None:
-    #... your buy/sell logic...
-
-    time.sleep(5) # Check every 5 seconds
+# --- PASTE THE REST OF YOUR BOT CODE BELOW THIS LINE ---
+# Your trading logic, loops, etc. keep everything as it was

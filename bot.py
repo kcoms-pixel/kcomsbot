@@ -16,8 +16,8 @@ PAIR = os.getenv("BINANCE_PAIR", "BTCUSDT")
 
 def send_telegram(msg):
     try:
-        token = os.getenv("TELEGRAM_TOKEN")
-        chat = os.getenv("TELEGRAM_CHAT_ID")
+        token = os.getenv("8834684274:AAE2vGC7TruiUV_YNNuaky5AMqOtoSMm4OU")
+        chat = os.getenv("498798769")
         if not token or not chat:
             print("Telegram not configured")
             return

@@ -24,17 +24,12 @@ def send_telegram(msg):
     except Exception as e:
         print(f"TG error: {e}", flush=True)
 
-def get_kraken_price():
+def get_kraken_price(): # keep name so rest of bot still works
     try:
-        ts = int(time.time() * 1000)
-        # Cache-bust Kraken
-        url = f"https://api.kraken.com/0/public/Ticker?pair=BTCUSD&_={ts}"
-        r = requests.get(url, headers={'Cache-Control': 'no-cache'}, timeout=10).json()
-        pair_key = list(r['result'].keys())[0]
-        price = float(r['result'][pair_key]['c'][0])
-        return price
-    except Exception as e:
-        print(f"Price error: {e}", flush=True)
+        url = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
+        r = requests.get(url, timeout=10).json()
+        return float(r['price'])
+    except:
         return None
 
 def run_bot():

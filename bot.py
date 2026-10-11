@@ -23,14 +23,35 @@ def send_telegram(msg):
         print(f"TG error {e}", flush=True)
 
 def get_binance_price():
+    # 1. Try Binance first
     try:
-        ts = int(time.time()*1000)
-        url = f"https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT&_={ts}"
-        r = requests.get(url, headers={'Cache-Control':'no-cache'}, timeout=10).json()
-        return float(r['price'])
+        url = f"https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT&_={int(time.time()*1000)}"
+        r = requests.get(url, timeout=10).json()
+        if 'price' in r:
+            return float(r['price'])
+        print(f"Binance blocked, response: {r}", flush=True)
     except Exception as e:
-        print(f"Price error: {e}", flush=True)
-        return None
+        print(f"Binance fail: {e}", flush=True)
+
+    # 2. Try Coinbase (never blocked on Render)
+    try:
+        r = requests.get("https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=10).json()
+        price = float(r['data']['amount'])
+        print(f"Using Coinbase fallback: {price}", flush=True)
+        return price
+    except Exception as e:
+        print(f"Coinbase fail: {e}", flush=True)
+
+    # 3. Try CoinGecko (last resort)
+    try:
+        r = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd", timeout=10).json()
+        price = float(r['bitcoin']['usd'])
+        print(f"Using CoinGecko fallback: {price}", flush=True)
+        return price
+    except Exception as e:
+        print(f"CoinGecko fail: {e}", flush=True)
+
+    return None
 
 def run_bot():
     print("KCOMS BOT V6 - BINANCE - LIVE - FIXED", flush=True)

@@ -6,36 +6,34 @@ from flask import Flask
 from datetime import datetime
 
 app = Flask(__name__)
-
 @app.route('/')
 def home():
-    return "KCOMS BOT V6 - KRAKEN - LIVE! - No Cache"
+    return "KCOMS BOT V6 - BINANCE - LIVE - FIXED"
 
 def send_telegram(msg):
     try:
         token = os.getenv("8834684274:AAE2vGC7TruiUV_YNNuaky5AMqOtoSMm4OU")
         chat = os.getenv("498798769")
         if not token or not chat:
-            print("Telegram not set")
+            print("Telegram not set", flush=True)
             return
         requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
                       data={"chat_id": chat, "text": msg}, timeout=10)
-        print(f"Telegram sent! {msg[:60]}", flush=True)
     except Exception as e:
-        print(f"TG error: {e}", flush=True)
+        print(f"TG error {e}", flush=True)
 
-def get_kraken_price(): # keep name so rest of bot still works
+def get_binance_price():
     try:
-        url = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
-        r = requests.get(url, timeout=10).json()
+        ts = int(time.time()*1000)
+        url = f"https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT&_={ts}"
+        r = requests.get(url, headers={'Cache-Control':'no-cache'}, timeout=10).json()
         return float(r['price'])
-    except:
+    except Exception as e:
+        print(f"Price error: {e}", flush=True)
         return None
 
 def run_bot():
-    print("KCOMS BOT V6 - KRAKEN - NO RATE LIMIT - WITH FLASK - CACHE FIX", flush=True)
-    send_telegram("🚀 Kcoms_bot V6 KRAKEN LIVE! Cache fix applied")
-
+    print("KCOMS BOT V6 - BINANCE - LIVE - FIXED", flush=True)
     wins = 0
     losses = 0
     pnl = 0.0
@@ -44,35 +42,29 @@ def run_bot():
     buy_price = 0
 
     while True:
-        price = get_kraken_price()
+        price = get_binance_price()
         if not price:
             time.sleep(5)
             continue
 
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Checking BTCUSD... Price: {price} | Wins: {wins} Losses: {losses} PnL: ${pnl:.2f}", flush=True)
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Checking BTCUSDT... Price: {price} | Wins: {wins} Losses: {losses} PnL: ${pnl:.2f}", flush=True)
 
-        # --- MORE ACTIVE V6 LOGIC ---
-        if not in_trade:
-            if last_price and price < last_price * 0.9995: # 0.05% dip
-                in_trade = True
-                buy_price = price
-                print(f"*** BUY signal! @ {price}", flush=True)
-                send_telegram(f"🟢 BUY BTCUSD @ {price} (Paper)")
-        else:
-            if price > buy_price * 1.005: # +0.5% TP
-                profit = price - buy_price
-                pnl += profit
+        if not in_trade and last_price and price < last_price * 0.9995:
+            in_trade = True
+            buy_price = price
+            print(f"*** BUY @ {price}", flush=True)
+
+        elif in_trade:
+            if price > buy_price * 1.005:
                 wins += 1
+                pnl += price - buy_price
                 in_trade = False
-                print(f"*** SELL PROFIT! @ {price} Profit: {profit:.2f}", flush=True)
-                send_telegram(f"💰 SELL PROFIT @ {price} +${profit:.2f} | Wins: {wins} PnL: ${pnl:.2f}")
-            elif price < buy_price * 0.995: # -0.5% SL
-                loss = price - buy_price
-                pnl += loss
+                print(f"*** SELL PROFIT @ {price}", flush=True)
+            elif price < buy_price * 0.995:
                 losses += 1
+                pnl += price - buy_price
                 in_trade = False
-                print(f"*** SELL LOSS! @ {price} Loss: {loss:.2f}", flush=True)
-                send_telegram(f"🔴 SELL LOSS @ {price} {loss:.2f} | Losses: {losses}")
+                print(f"*** SELL LOSS @ {price}", flush=True)
 
         last_price = price
         time.sleep(8)

@@ -8,53 +8,30 @@ from datetime import datetime
 app = Flask(__name__)
 @app.route('/')
 def home():
-    return "KCOMS BOT V6 - BINANCE - LIVE - FIXED"
+    return "KCOMS BOT V6 - BINANCE PRICE - LIVE!"
 
 def send_telegram(msg):
     try:
         token = os.getenv("8834684274:AAE2vGC7TruiUV_YNNuaky5AMqOtoSMm4OU")
         chat = os.getenv("498798769")
         if not token or not chat:
-            print("Telegram not set", flush=True)
             return
         requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
                       data={"chat_id": chat, "text": msg}, timeout=10)
-    except Exception as e:
-        print(f"TG error {e}", flush=True)
+    except:
+        pass
 
-def get_binance_price():
-    # 1. Try Binance first
+# === 1-LINE FIX FROM THAT MESSAGE ===
+def get_kraken_price(): # keep name so rest of bot still works
     try:
-        url = f"https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT&_={int(time.time()*1000)}"
+        url = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
         r = requests.get(url, timeout=10).json()
-        if 'price' in r:
-            return float(r['price'])
-        print(f"Binance blocked, response: {r}", flush=True)
-    except Exception as e:
-        print(f"Binance fail: {e}", flush=True)
-
-    # 2. Try Coinbase (never blocked on Render)
-    try:
-        r = requests.get("https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=10).json()
-        price = float(r['data']['amount'])
-        print(f"Using Coinbase fallback: {price}", flush=True)
-        return price
-    except Exception as e:
-        print(f"Coinbase fail: {e}", flush=True)
-
-    # 3. Try CoinGecko (last resort)
-    try:
-        r = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd", timeout=10).json()
-        price = float(r['bitcoin']['usd'])
-        print(f"Using CoinGecko fallback: {price}", flush=True)
-        return price
-    except Exception as e:
-        print(f"CoinGecko fail: {e}", flush=True)
-
-    return None
+        return float(r['price'])
+    except:
+        return None
 
 def run_bot():
-    print("KCOMS BOT V6 - BINANCE - LIVE - FIXED", flush=True)
+    print("KCOMS BOT V6 - BINANCE PRICE - LIVE!", flush=True)
     wins = 0
     losses = 0
     pnl = 0.0
@@ -63,19 +40,19 @@ def run_bot():
     buy_price = 0
 
     while True:
-        price = get_binance_price()
+        price = get_kraken_price()
         if not price:
             time.sleep(5)
             continue
 
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Checking BTCUSDT... Price: {price} | Wins: {wins} Losses: {losses} PnL: ${pnl:.2f}", flush=True)
 
-        if not in_trade and last_price and price < last_price * 0.9995:
-            in_trade = True
-            buy_price = price
-            print(f"*** BUY @ {price}", flush=True)
-
-        elif in_trade:
+        if not in_trade:
+            if last_price and price < last_price * 0.9995:
+                in_trade = True
+                buy_price = price
+                print(f"*** BUY @ {price}", flush=True)
+        else:
             if price > buy_price * 1.005:
                 wins += 1
                 pnl += price - buy_price

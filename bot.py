@@ -1,67 +1,84 @@
-import os, threading, time, requests
+import os
+import threading
+import time
+import requests
 from flask import Flask
 from datetime import datetime
 
 app = Flask(__name__)
 @app.route('/')
 def home():
-    return "KCOMS BOT V7 - FIXED - BINANCE PRICE WORKS!"
+    return "KCOMS BOT V6 - BINANCE PRICE - LIVE!"
+
+def send_telegram(msg):
+    try:
+        token = os.getenv("TELEGRAM_TOKEN")
+        chat = os.getenv("TELEGRAM_CHAT_ID")
+        if not token or not chat:
+            print("Telegram not set - add vars in Render", flush=True)
+            return
+        requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                      data={"chat_id": chat, "text": msg}, timeout=10)
+        print(f"Telegram sent! {msg[:60]}", flush=True)
+    except Exception as e:
+        print(f"TG error: {e}", flush=True)
 
 def get_price():
-    # 1. Try UNBLOCKED Binance endpoint (works on Render!)
+    # Binance is NOT blocked on Render + matches your screenshot $83,046
     try:
-        url = "https://data-api.binance.vision/api/v3/ticker/price?symbol=BTCUSDT"
-        r = requests.get(url, timeout=10).json()
-        if 'price' in r:
-            return float(r['price']), "Binance.Vision"
+        ts = int(time.time()*1000)
+        url = f"https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT&_={ts}"
+        r = requests.get(url, headers={'Cache-Control':'no-cache'}, timeout=10)
+        data = r.json()
+        print(f"API raw: {data}", flush=True)
+        return float(data['price'])
     except Exception as e:
-        print(f"Binance.vision fail: {e}", flush=True)
-
-    # 2. Try Coinbase - same price, never blocked
-    try:
-        r = requests.get("https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=10).json()
-        return float(r['data']['amount']), "Coinbase"
-    except:
-        pass
-
-    # 3. Last resort CoinGecko
-    try:
-        r = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd", timeout=10).json()
-        return float(r['bitcoin']['usd']), "CoinGecko"
-    except:
-        return None, "None"
+        print(f"PRICE ERROR: {e}", flush=True)
+        return None
 
 def run_bot():
-    print("KCOMS BOT V7 - FIXED - STARTING", flush=True)
-    wins=0; losses=0; pnl=0.0
-    last_price=None; in_trade=False; buy_price=0
-    
+    print("KCOMS BOT V6 - BINANCE PRICE - STARTING", flush=True)
+    send_telegram("🚀 Bot starting - Binance price feed")
+    wins = 0
+    losses = 0
+    pnl = 0.0
+    last_price = None
+    in_trade = False
+    buy_price = 0
+
     while True:
         try:
-            price, source = get_price()
+            price = get_price()
             if not price:
-                print("All price sources failed, retry in 5s", flush=True)
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] No price, retrying...", flush=True)
                 time.sleep(5)
                 continue
 
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] {source} Price: {price} | Wins:{wins} Losses:{losses} PnL:${pnl:.2f}", flush=True)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Checking BTCUSDT... Price: {price} | Wins: {wins} Losses: {losses} PnL: ${pnl:.2f}", flush=True)
 
             if not in_trade:
                 if last_price and price < last_price * 0.9995:
-                    in_trade=True
-                    buy_price=price
+                    in_trade = True
+                    buy_price = price
                     print(f"*** BUY @ {price}", flush=True)
+                    send_telegram(f"🟢 BUY @ {price}")
             else:
                 if price > buy_price * 1.005:
-                    wins+=1; pnl+=price-buy_price; in_trade=False
-                    print(f"*** SELL WIN @ {price} +{price-buy_price:.2f}", flush=True)
+                    wins += 1
+                    pnl += price - buy_price
+                    in_trade = False
+                    print(f"*** SELL PROFIT @ {price}", flush=True)
+                    send_telegram(f"💰 SELL PROFIT @ {price}")
                 elif price < buy_price * 0.995:
-                    losses+=1; pnl+=price-buy_price; in_trade=False
+                    losses += 1
+                    pnl += price - buy_price
+                    in_trade = False
                     print(f"*** SELL LOSS @ {price}", flush=True)
+                    send_telegram(f"🔴 SELL LOSS @ {price}")
 
-            last_price=price
+            last_price = price
         except Exception as e:
-            print(f"Loop error: {e}", flush=True)
+            print(f"BOT LOOP ERROR: {e}", flush=True)
         time.sleep(8)
 
 if __name__ == "__main__":

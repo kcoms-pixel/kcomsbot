@@ -22,13 +22,18 @@ def send_telegram(msg):
         pass
 
 # === 1-LINE FIX FROM THAT MESSAGE ===
-def get_kraken_price(): # keep name so rest of bot still works
+def get_kraken_price():
+    # Use Coinbase - same price as Binance $83,046, never blocked
     try:
-        url = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
-        r = requests.get(url, timeout=10).json()
-        return float(r['price'])
-    except:
-        return None
+        r = requests.get("https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=10).json()
+        return float(r['data']['amount'])
+    except Exception as e:
+        print(f"Coinbase fail {e}, trying CoinGecko", flush=True)
+        try:
+            r = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd", timeout=10).json()
+            return float(r['bitcoin']['usd'])
+        except:
+            return None
 
 def run_bot():
     print("KCOMS BOT V6 - BINANCE PRICE - LIVE!", flush=True)

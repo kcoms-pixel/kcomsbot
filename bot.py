@@ -30,8 +30,8 @@ def send_tg(msg):
         if not TG_TOKEN or not TG_CHAT:
             print(f"[TG DISABLED] {msg}", flush=True)
             return
-        url=f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id":TG_CHAT,"text":msg,"parse_mode":"Markdown"}, timeout=10)
+        url=f"https://api.telegram.org/bot{8834684274:AAE2vGC7TruiUV_YNNuaky5AMqOtoSMm4OU}/sendMessage"
+        requests.post(url, json={"chat_id":498798769,"text":msg,"parse_mode":"Markdown"}, timeout=10)
         print(f"[TG SENT] {msg}", flush=True)
     except Exception as e:
         print(f"TG error {e}", flush=True)

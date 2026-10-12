@@ -5,8 +5,8 @@ from datetime import datetime, timedelta
 app = Flask(__name__)
 
 SYMBOL="BTCUSDT"
-TG_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN","")
-TG_CHAT=os.getenv("TELEGRAM_CHAT_ID","")
+TG_TOKEN=os.getenv("8834684274:AAE2vGC7TruiUV_YNNuaky5AMqOtoSMm4OU","")
+TG_CHAT=os.getenv("498798769","")
 MAX_DAILY=5
 RR=3.0
 

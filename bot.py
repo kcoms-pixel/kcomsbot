@@ -11,8 +11,8 @@ TRADE_ENABLED=os.getenv("TRADE_ENABLED","false").lower()=="true"
 TRADE_SIZE_USDT=float(os.getenv("TRADE_SIZE_USDT","5"))
 RISK_PERCENT=float(os.getenv("RISK_PERCENT","0.1"))
 USE_TESTNET=os.getenv("USE_TESTNET","false").lower()=="true"
-TG_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN","")
-TG_CHAT=os.getenv("TELEGRAM_CHAT_ID","")
+TG_TOKEN=os.getenv("8834684274:AAE2vGC7TruiUV_YNNuaky5AMqOtoSMm4OU","")
+TG_CHAT=os.getenv("498798769","")
 BASE_URL="https://testnet.binance.vision" if USE_TESTNET else "https://data-api.binance.vision"
 TRADE_URL="https://testnet.binance.vision" if USE_TESTNET else "https://api.binance.com"
 MAX_TRADES_PER_DAY=5

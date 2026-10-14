@@ -1,4 +1,4 @@
-# KCOMS V6.3 FINAL - 5 MIN COOLDOWN + BALANCE TRACKER
+# KCOMS V6.4 FINAL - RR 1:2 + 5MIN COOLDOWN + BALANCE TRACKER
 import threading, time, requests, os, hmac, hashlib
 from flask import Flask
 from datetime import datetime, timedelta
@@ -13,23 +13,23 @@ TRADE_SIZE_USDT=float(os.getenv("TRADE_SIZE_USDT","5"))
 RISK_PERCENT=float(os.getenv("RISK_PERCENT","0.1"))
 TG_TOKEN=os.getenv("8834684274:AAE2vGC7TruiUV_YNNuaky5AMqOtoSMm4OU","")
 TG_CHAT=os.getenv("498798769","")
-MAX_TRADES=5
-RR=3.0
-COOLDOWN_MINUTES=5 # <-- CHANGED FROM 120 to 5
+MAX_TRADES=15
+RR=2.0 # <-- CHANGED TO 1:2 (was 3.0)
+COOLDOWN_MINUTES=5
 
 PAPER_BALANCE_FILE="/tmp/kcoms_balance.txt"
 daily_trades=0
 last_day=datetime.utcnow().day
 cooldown_until=None
 used_zones=[]
-latest={"price":0,"ema":0,"state":"BOOTING","dir":"NONE","last":"Booting V6.3","wins":0,"losses":0,"bal":"100","daily":0}
+latest={"price":0,"ema":0,"state":"BOOTING","dir":"NONE","last":"Booting V6.4 RR 1:2","wins":0,"losses":0,"bal":"100","daily":0}
 start_time=time.time()
 
 @app.route('/')
 def home():
     up=int(time.time()-start_time)
     cd = f"Cooldown {cooldown_until.strftime('%H:%M')}" if cooldown_until and datetime.utcnow() < cooldown_until else "Ready"
-    return f"<h1>KCOMS V6.3 5min Cooldown ✅</h1><p>Uptime {up}s | Price {latest['price']:.2f} | EMA200 {latest['ema']:.2f} | {latest['state']} {latest['dir']} | {cd}</p><p>Bal ${latest['bal']} | W:{latest['wins']} L:{latest['losses']} D:{latest['daily']}/5</p><p>Last: {latest['last']}</p><script>setTimeout(()=>location.reload(),3000)</script>"
+    return f"<h1>KCOMS V6.4 RR 1:2 ✅</h1><p>Uptime {up}s | Price {latest['price']:.2f} | EMA200 {latest['ema']:.2f} | {latest['state']} {latest['dir']} | RR 1:{RR} | {cd}</p><p>Bal ${latest['bal']} | W:{latest['wins']} L:{latest['losses']} D:{latest['daily']}/5</p><p>Last: {latest['last']}</p><script>setTimeout(()=>location.reload(),3000)</script>"
 
 @app.route('/health')
 def health():
@@ -71,8 +71,7 @@ def get_klines(interval="15m", limit=200):
             data=r.json()
             if isinstance(data, list) and len(data)>0:
                 return [{"h":float(k[2]),"l":float(k[3]),"c":float(k[4]),"o":float(k[1])} for k in data]
-        except Exception as e:
-            print(f"Fail {base} -> {e}", flush=True)
+        except: pass
     return None
 
 def calc_ema(prices, period=200):
@@ -110,8 +109,7 @@ def place_order(side, qty):
 
 def run_bot():
     global daily_trades, last_day, cooldown_until, used_zones, latest
-    print(f"START V6.3 - {COOLDOWN_MINUTES} MIN COOLDOWN", flush=True)
-    send_tg(f"🎯 V6.3 Started - {COOLDOWN_MINUTES}min cooldown")
+    print(f"START V6.4 - RR 1:{RR} - {COOLDOWN_MINUTES} MIN COOLDOWN", flush=True)
     state="SCANNING"; zone=(0,0); direction="NONE"; wins=0; losses=0
     balance=load_paper_balance()
     in_pos=False; pos_side="NONE"; entry_price=0; sl_price=0; tp_price=0
@@ -120,7 +118,6 @@ def run_bot():
         try:
             today=datetime.utcnow().day
             if today!=last_day: daily_trades=0; last_day=today; used_zones=[]
-
             if cooldown_until and datetime.utcnow() < cooldown_until:
                 remaining = int((cooldown_until - datetime.utcnow()).total_seconds())
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] COOLDOWN {remaining}s left | Bal ${balance:.2f}", flush=True)
@@ -131,18 +128,14 @@ def run_bot():
 
             df15=get_klines("15m",200)
             df1=get_klines("1m",120)
-
             if not df15 or not df1:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Binance blocked retry 5s", flush=True)
-                latest["state"]="BLOCKED"
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Binance blocked retry", flush=True)
                 time.sleep(5); continue
 
             price=df15[-1]["c"]
             closes15=[k["c"] for k in df15]
             ema200=calc_ema(closes15,200)
-
-            now_str=datetime.now().strftime('%H:%M:%S')
-            print(f"[{now_str}] Price {price:.2f} | EMA200 {ema200:.2f} | {state} | Bal ${balance:.2f} | W:{wins} L:{losses} D:{daily_trades}/{MAX_TRADES}", flush=True)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Price {price:.2f} | EMA200 {ema200:.2f} | {state} | RR 1:{RR} | Bal ${balance:.2f} | W:{wins} L:{losses}", flush=True)
             latest.update({"price":price,"ema":ema200,"state":state,"dir":direction,"wins":wins,"losses":losses,"bal":f"{balance:.2f}","daily":daily_trades})
 
             if state=="SCANNING":
@@ -150,23 +143,19 @@ def run_bot():
                 if price < rl and price < ema200:
                     pz=(min(k["h"] for k in df15[-15:]), max(k["h"] for k in df15[-15:]))
                     if not any(abs(pz[0]-z[0])<50 for z in used_zones):
-                        direction="SHORT"; zone=pz
-                        print(f"📉 BEAR BOS @ {price:.2f}", flush=True); send_tg(f"📉 BEAR BOS @ {price:.2f}"); state="WAIT_LIQ"
+                        direction="SHORT"; zone=pz; print(f"📉 BEAR BOS @ {price:.2f}", flush=True); state="WAIT_LIQ"
                 elif price > rh and price > ema200:
                     pz=(min(k["l"] for k in df15[-15:]), max(k["l"] for k in df15[-15:]))
                     if not any(abs(pz[0]-z[0])<50 for z in used_zones):
-                        direction="LONG"; zone=pz
-                        print(f"📈 BULL BOS @ {price:.2f}", flush=True); send_tg(f"📈 BULL BOS @ {price:.2f}"); state="WAIT_LIQ"
+                        direction="LONG"; zone=pz; print(f"📈 BULL BOS @ {price:.2f}", flush=True); state="WAIT_LIQ"
 
             elif state=="WAIT_LIQ":
                 if direction=="SHORT" and price>=zone[0]*0.999:
                     eq=max(k["h"] for k in df15[-12:-2])
-                    if price>eq*1.0005:
-                        print(f"💧 Swept SHORT @ {price:.2f}", flush=True); send_tg(f"💧 Swept SHORT"); state="WAIT_CHOCH"
+                    if price>eq*1.0005: print(f"💧 Swept SHORT @ {price:.2f}", flush=True); state="WAIT_CHOCH"
                 elif direction=="LONG" and price<=zone[1]*1.001:
                     eq=min(k["l"] for k in df15[-12:-2])
-                    if price<eq*0.9995:
-                        print(f"💧 Swept LONG @ {price:.2f}", flush=True); send_tg(f"💧 Swept LONG"); state="WAIT_CHOCH"
+                    if price<eq*0.9995: print(f"💧 Swept LONG @ {price:.2f}", flush=True); state="WAIT_CHOCH"
 
             elif state=="WAIT_CHOCH":
                 if direction=="SHORT":
@@ -175,47 +164,34 @@ def run_bot():
                         sl_price=max(k["h"] for k in df1[-15:])+40; entry_price=price
                         tp_price=entry_price-(abs(entry_price-sl_price)*RR)
                         qty=calc_qty(entry_price, sl_price, balance)
-                        msg=f"🔴 A+ SHORT {entry_price:.2f} SL {sl_price:.2f} TP {tp_price:.2f}"
-                        print(msg, flush=True); send_tg(msg)
-                        if place_order("SELL", qty):
-                            in_pos=True; pos_side="SHORT"; state="IN_TRADE"; daily_trades+=1; used_zones.append(zone); latest["last"]=msg
+                        msg=f"🔴 A+ SHORT {entry_price:.2f} SL {sl_price:.2f} TP {tp_price:.2f} RR 1:{RR}"
+                        print(msg, flush=True)
+                        if place_order("SELL", qty): in_pos=True; pos_side="SHORT"; state="IN_TRADE"; daily_trades+=1; used_zones.append(zone); latest["last"]=msg
                 else:
                     m1_high=max(k["h"] for k in df1[-20:-5])
                     if df1[-1]["c"] > m1_high * 1.0015 and df1[-1]["c"] > df1[-1]["o"]:
                         sl_price=min(k["l"] for k in df1[-15:])-40; entry_price=price
                         tp_price=entry_price+(abs(entry_price-sl_price)*RR)
                         qty=calc_qty(entry_price, sl_price, balance)
-                        msg=f"🟢 A+ LONG {entry_price:.2f} SL {sl_price:.2f} TP {tp_price:.2f}"
-                        print(msg, flush=True); send_tg(msg)
-                        if place_order("BUY", qty):
-                            in_pos=True; pos_side="LONG"; state="IN_TRADE"; daily_trades+=1; used_zones.append(zone); latest["last"]=msg
+                        msg=f"🟢 A+ LONG {entry_price:.2f} SL {sl_price:.2f} TP {tp_price:.2f} RR 1:{RR}"
+                        print(msg, flush=True)
+                        if place_order("BUY", qty): in_pos=True; pos_side="LONG"; state="IN_TRADE"; daily_trades+=1; used_zones.append(zone); latest["last"]=msg
 
             elif state=="IN_TRADE":
                 risk_dist=abs(entry_price-sl_price)
                 qty=calc_qty(entry_price, sl_price, balance)
                 profit_usd=risk_dist*RR*qty
                 loss_usd=risk_dist*qty
-
                 if pos_side=="SHORT" and price <= tp_price:
-                    place_order("BUY", qty)
-                    balance+=profit_usd; save_paper_balance(balance); wins+=1
-                    print(f"✅ TP SHORT @ {price:.2f} +${profit_usd:.2f} → Bal ${balance:.2f}", flush=True)
-                    send_tg(f"✅ TP SHORT +${profit_usd:.2f} Bal ${balance:.2f}")
-                    state="SCANNING"; in_pos=False
+                    place_order("BUY", qty); balance+=profit_usd; save_paper_balance(balance); wins+=1
+                    print(f"✅ TP SHORT @ {price:.2f} +${profit_usd:.2f} → Bal ${balance:.2f}", flush=True); state="SCANNING"; in_pos=False
                 elif pos_side=="LONG" and price >= tp_price:
-                    place_order("SELL", qty)
-                    balance+=profit_usd; save_paper_balance(balance); wins+=1
-                    print(f"✅ TP LONG @ {price:.2f} +${profit_usd:.2f} → Bal ${balance:.2f}", flush=True)
-                    send_tg(f"✅ TP LONG +${profit_usd:.2f} Bal ${balance:.2f}")
-                    state="SCANNING"; in_pos=False
+                    place_order("SELL", qty); balance+=profit_usd; save_paper_balance(balance); wins+=1
+                    print(f"✅ TP LONG @ {price:.2f} +${profit_usd:.2f} → Bal ${balance:.2f}", flush=True); state="SCANNING"; in_pos=False
                 elif (pos_side=="SHORT" and price > sl_price) or (pos_side=="LONG" and price < sl_price):
-                    place_order("BUY" if pos_side=="SHORT" else "SELL", qty)
-                    balance-=loss_usd; save_paper_balance(balance); losses+=1
+                    place_order("BUY" if pos_side=="SHORT" else "SELL", qty); balance-=loss_usd; save_paper_balance(balance); losses+=1
                     cooldown_until=datetime.utcnow()+timedelta(minutes=COOLDOWN_MINUTES)
-                    print(f"❌ SL {pos_side} @ {price:.2f} -${loss_usd:.2f} → Bal ${balance:.2f} Cooldown {COOLDOWN_MINUTES}m", flush=True)
-                    send_tg(f"❌ SL {pos_side} -${loss_usd:.2f} Bal ${balance:.2f}")
-                    state="SCANNING"; in_pos=False
-
+                    print(f"❌ SL {pos_side} @ {price:.2f} -${loss_usd:.2f} → Bal ${balance:.2f} Cooldown {COOLDOWN_MINUTES}m", flush=True); state="SCANNING"; in_pos=False
             time.sleep(3)
         except Exception as e:
             print(f"LOOP ERR {e}", flush=True); time.sleep(3)

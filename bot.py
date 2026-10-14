@@ -1,4 +1,4 @@
-# KCOMS V6.1 FINAL COMBINED - PAPER BALANCE GROWS/SHRINKS
+# KCOMS V6.3 FINAL - 5 MIN COOLDOWN + BALANCE TRACKER
 import threading, time, requests, os, hmac, hashlib
 from flask import Flask
 from datetime import datetime, timedelta
@@ -15,20 +15,21 @@ TG_TOKEN=os.getenv("8834684274:AAE2vGC7TruiUV_YNNuaky5AMqOtoSMm4OU","")
 TG_CHAT=os.getenv("498798769","")
 MAX_TRADES=5
 RR=3.0
+COOLDOWN_MINUTES=5 # <-- CHANGED FROM 120 to 5
 
 PAPER_BALANCE_FILE="/tmp/kcoms_balance.txt"
 daily_trades=0
 last_day=datetime.utcnow().day
 cooldown_until=None
 used_zones=[]
-latest={"price":0,"ema":0,"state":"BOOTING","dir":"NONE","last":"Booting V6.1","wins":0,"losses":0,"bal":"100","daily":0}
+latest={"price":0,"ema":0,"state":"BOOTING","dir":"NONE","last":"Booting V6.3","wins":0,"losses":0,"bal":"100","daily":0}
 start_time=time.time()
 
 @app.route('/')
 def home():
     up=int(time.time()-start_time)
     cd = f"Cooldown {cooldown_until.strftime('%H:%M')}" if cooldown_until and datetime.utcnow() < cooldown_until else "Ready"
-    return f"<h1>KCOMS V6.1 FINAL ✅ Balance Tracker</h1><p>Uptime {up}s | Price {latest['price']:.2f} | EMA200 {latest['ema']:.2f} | {latest['state']} {latest['dir']} | {cd}</p><p>Bal ${latest['bal']} | W:{latest['wins']} L:{latest['losses']} D:{latest['daily']}/5</p><p>Last: {latest['last']}</p><script>setTimeout(()=>location.reload(),3000)</script>"
+    return f"<h1>KCOMS V6.3 5min Cooldown ✅</h1><p>Uptime {up}s | Price {latest['price']:.2f} | EMA200 {latest['ema']:.2f} | {latest['state']} {latest['dir']} | {cd}</p><p>Bal ${latest['bal']} | W:{latest['wins']} L:{latest['losses']} D:{latest['daily']}/5</p><p>Last: {latest['last']}</p><script>setTimeout(()=>location.reload(),3000)</script>"
 
 @app.route('/health')
 def health():
@@ -109,8 +110,8 @@ def place_order(side, qty):
 
 def run_bot():
     global daily_trades, last_day, cooldown_until, used_zones, latest
-    print("START V6.1 FINAL - BALANCE TRACKER ACTIVE", flush=True)
-    send_tg("🎯 V6.1 Started - Balance Tracker")
+    print(f"START V6.3 - {COOLDOWN_MINUTES} MIN COOLDOWN", flush=True)
+    send_tg(f"🎯 V6.3 Started - {COOLDOWN_MINUTES}min cooldown")
     state="SCANNING"; zone=(0,0); direction="NONE"; wins=0; losses=0
     balance=load_paper_balance()
     in_pos=False; pos_side="NONE"; entry_price=0; sl_price=0; tp_price=0
@@ -121,7 +122,8 @@ def run_bot():
             if today!=last_day: daily_trades=0; last_day=today; used_zones=[]
 
             if cooldown_until and datetime.utcnow() < cooldown_until:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] COOLDOWN till {cooldown_until.strftime('%H:%M')} | Bal ${balance:.2f}", flush=True)
+                remaining = int((cooldown_until - datetime.utcnow()).total_seconds())
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] COOLDOWN {remaining}s left | Bal ${balance:.2f}", flush=True)
                 time.sleep(10); continue
             if daily_trades>=MAX_TRADES:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] DAILY LIMIT {daily_trades}/{MAX_TRADES} | Bal ${balance:.2f}", flush=True)
@@ -138,12 +140,6 @@ def run_bot():
             price=df15[-1]["c"]
             closes15=[k["c"] for k in df15]
             ema200=calc_ema(closes15,200)
-            # Only fetch real balance if trading real, else use paper
-            if not TRADE_ENABLED:
-                # keep local paper balance
-                pass
-            else:
-                balance=get_balance()
 
             now_str=datetime.now().strftime('%H:%M:%S')
             print(f"[{now_str}] Price {price:.2f} | EMA200 {ema200:.2f} | {state} | Bal ${balance:.2f} | W:{wins} L:{losses} D:{daily_trades}/{MAX_TRADES}", flush=True)
@@ -215,8 +211,8 @@ def run_bot():
                 elif (pos_side=="SHORT" and price > sl_price) or (pos_side=="LONG" and price < sl_price):
                     place_order("BUY" if pos_side=="SHORT" else "SELL", qty)
                     balance-=loss_usd; save_paper_balance(balance); losses+=1
-                    cooldown_until=datetime.utcnow()+timedelta(hours=2)
-                    print(f"❌ SL {pos_side} @ {price:.2f} -${loss_usd:.2f} → Bal ${balance:.2f}", flush=True)
+                    cooldown_until=datetime.utcnow()+timedelta(minutes=COOLDOWN_MINUTES)
+                    print(f"❌ SL {pos_side} @ {price:.2f} -${loss_usd:.2f} → Bal ${balance:.2f} Cooldown {COOLDOWN_MINUTES}m", flush=True)
                     send_tg(f"❌ SL {pos_side} -${loss_usd:.2f} Bal ${balance:.2f}")
                     state="SCANNING"; in_pos=False
 

@@ -32,9 +32,9 @@ app = Flask(__name__)
 SYMBOL = os.getenv("SYMBOL", "BTCUSDT").upper()
 MIN_SCORE = int(os.getenv("MIN_SCORE", "80"))
 SCAN_INTERVAL = max(1, int(os.getenv("SCAN_INTERVAL", "1")))
-MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "4"))
-COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "15"))
-RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.5"))  # percent of paper equity
+MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "15"))
+COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "5"))
+RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.1"))  # percent of paper equity
 RR_TARGET = float(os.getenv("RR_TARGET", "2.0"))
 MAX_NOTIONAL_USDT = float(os.getenv("MAX_NOTIONAL_USDT", "100"))
 PAPER_BALANCE_FILE = os.getenv("PAPER_BALANCE_FILE", "/tmp/kcoms_v7_balance.json")
@@ -528,24 +528,28 @@ def status():
                         "paper_only": True, "minimum_score": MIN_SCORE})
 
 
-# Start the engine when the module is imported by Gunicorn (Render).
-# Deploy with ONE Gunicorn worker so only one trading engine runs.
+# Start the analysis engine when the module is imported by Gunicorn as well as
+# when run directly. Render's Procfile uses exactly one Gunicorn worker so this
+# process-local guard prevents duplicate engine threads in the supported setup.
 _engine_thread = None
 _engine_start_lock = threading.Lock()
+
 
 def start_engine_once() -> None:
     global _engine_thread
     with _engine_start_lock:
-        if _engine_thread is None or not _engine_thread.is_alive():
-            _engine_thread = threading.Thread(
-                target=run_bot, daemon=True, name="kcoms-engine"
-            )
-            _engine_thread.start()
+        if _engine_thread is not None and _engine_thread.is_alive():
+            return
+        _engine_thread = threading.Thread(
+            target=run_bot, daemon=True, name="kcoms-engine"
+        )
+        _engine_thread.start()
 
 
-# Gunicorn imports this module; __main__ is not executed in that deployment mode.
+# Gunicorn imports this module; starting here ensures the paper engine runs.
 start_engine_once()
+
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port, threaded=True, use_reloader=False)
+    app.run(host="0.0.0.0", port=port, threaded=True)

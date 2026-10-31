@@ -32,6 +32,7 @@ app = Flask(__name__)
 SYMBOL = os.getenv("SYMBOL", "BTCUSDT").upper()
 MIN_SCORE = int(os.getenv("MIN_SCORE", "80"))
 SCAN_INTERVAL = max(1, int(os.getenv("SCAN_INTERVAL", "1")))
+LOG_INTERVAL_SECONDS = max(1, int(os.getenv("LOG_INTERVAL_SECONDS", "5")))
 MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "15"))
 COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "5"))
 RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.1"))  # percent of paper equity
@@ -71,7 +72,7 @@ lock = threading.RLock()
 latest = {
     "bot": "KCOMS V7", "status": "BOOTING", "symbol": SYMBOL,
     "price": 0.0, "bias": "NEUTRAL", "signal": "NONE", "score": 0,
-    "wins": 0, "losses": 0, "trades_today": 0,
+    "wins": 0, "losses": 0, "completed_trades": 0, "trades_today": 0,
     "balance": PAPER_START_BALANCE, "last_signal": "Starting",
     "market_regime": "UNKNOWN", "last_error": "",
 }
@@ -86,6 +87,7 @@ state = {
     "last_processed_1m": None,
     "last_alert_key": None,
     "last_trade_key": None,
+    "last_status_log": 0.0,
 }
 
 # Cached candles avoid requesting five full histories every second.
@@ -430,6 +432,48 @@ def monitor_paper_position(price: float) -> None:
     send_tg(msg)
     latest["last_signal"] = msg
     state["position"] = None
+    latest.update({"wins": state["wins"], "losses": state["losses"],
+                   "completed_trades": state["wins"] + state["losses"],
+                   "balance": round(state["balance"], 2)})
+
+# ----------------------------- Console monitoring -----------------------------
+def log_live_status(price: Optional[float], force: bool = False) -> None:
+    """Write a compact, periodic paper-account heartbeat to Render logs."""
+    now = time.time()
+    if not force and now - float(state.get("last_status_log", 0.0)) < LOG_INTERVAL_SECONDS:
+        return
+    state["last_status_log"] = now
+
+    pos = state.get("position")
+    status = "IN_TRADE" if pos else latest.get("status", "SCANNING")
+    if pos and price is not None:
+        direction = 1 if pos["side"] == "LONG" else -1
+        unrealized = (float(price) - float(pos["entry"])) * float(pos["qty"]) * direction
+        pos_text = (f'{pos["side"]} entry={float(pos["entry"]):.2f} '
+                    f'SL={float(pos["stop"]):.2f} TP={float(pos["target"]):.2f}')
+    elif pos:
+        unrealized = 0.0
+        pos_text = f'{pos["side"]} entry={float(pos["entry"]):.2f}'
+    else:
+        unrealized = 0.0
+        pos_text = "NONE"
+
+    completed = int(state["wins"]) + int(state["losses"])
+    price_text = f"{float(price):,.2f}" if price is not None else "UNAVAILABLE"
+    cooldown_left = max(0, int(float(state["cooldown_until"]) - now))
+    cooldown_text = f"{cooldown_left}s" if cooldown_left else "READY"
+    log.info(
+        "HEARTBEAT | BINANCE %s=%s | STATUS=%s | DIRECTION=%s | SCORE=%s/100 | "
+        "TRADES_TODAY=%s/%s | COMPLETED=%s | WINS=%s | LOSSES=%s | "
+        "WIN_RATE=%.1f%% | PAPER_BALANCE=$%.2f | OPEN_POSITION=%s | "
+        "UNREALIZED_PNL=$%+.4f | COOLDOWN=%s",
+        SYMBOL, price_text, status, latest.get("signal", "NONE"),
+        latest.get("score", 0), state["trades_today"], MAX_TRADES_PER_DAY,
+        completed, state["wins"], state["losses"],
+        (100.0 * state["wins"] / completed) if completed else 0.0,
+        state["balance"], pos_text, unrealized, cooldown_text,
+    )
+
 
 # ----------------------------- Main loop -----------------------------
 def run_bot() -> None:
@@ -440,7 +484,8 @@ def run_bot() -> None:
         f"Minimum score: {MIN_SCORE}/100 | Paper trading only\n"
         f"Target RR: 1:{RR_TARGET} | Scan: {SCAN_INTERVAL}s"
     )
-    log.info("KCOMS V7 started: %s; minimum score %s", SYMBOL, MIN_SCORE)
+    log.info("KCOMS V7 started: %s; minimum score %s; risk %.3f%%; daily trade limit %s; cooldown %sm; heartbeat every %ss", SYMBOL, MIN_SCORE, RISK_PERCENT, MAX_TRADES_PER_DAY, COOLDOWN_MINUTES, LOG_INTERVAL_SECONDS)
+    log_live_status(None, force=True)
 
     while True:
         try:
@@ -449,12 +494,22 @@ def run_bot() -> None:
                 price = get_price()
                 if price is None:
                     latest["status"] = "WAITING_FOR_PRICE"
+                    latest["last_error"] = "Binance price unavailable"
+                    log_live_status(None)
                     time.sleep(SCAN_INTERVAL)
                     continue
                 monitor_paper_position(price)
                 analysis = analyse_market()
                 if analysis is None:
-                    latest.update({"status": "WAITING_FOR_DATA", "price": price})
+                    latest.update({
+                        "status": "IN_TRADE" if state["position"] else "WAITING_FOR_DATA",
+                        "price": round(price, 2), "wins": state["wins"],
+                        "losses": state["losses"],
+                        "completed_trades": state["wins"] + state["losses"],
+                        "trades_today": state["trades_today"],
+                        "balance": round(state["balance"], 2),
+                    })
+                    log_live_status(price)
                     time.sleep(SCAN_INTERVAL)
                     continue
 
@@ -464,6 +519,7 @@ def run_bot() -> None:
                     "signal": analysis["direction"], "score": analysis["score"],
                     "market_regime": analysis["regime"],
                     "wins": state["wins"], "losses": state["losses"],
+                    "completed_trades": state["wins"] + state["losses"],
                     "trades_today": state["trades_today"],
                     "balance": round(state["balance"], 2), "last_error": "",
                 })
@@ -493,6 +549,7 @@ def run_bot() -> None:
                 latest["losses"] = state["losses"]
                 latest["trades_today"] = state["trades_today"]
                 latest["balance"] = round(state["balance"], 2)
+                log_live_status(price)
             time.sleep(SCAN_INTERVAL)
         except Exception as exc:
             log.exception("Main loop error")
@@ -510,8 +567,10 @@ def home():
         f"<p>{data['symbol']} | PAPER ONLY | Minimum score {MIN_SCORE}/100</p>"
         f"<p>Status: {data['status']} | Price: {data['price']} | Bias: {data['bias']}</p>"
         f"<p>Signal: {data['signal']} ({data['score']}/100) | Regime: {data['market_regime']}</p>"
-        f"<p>Balance: ${data['balance']} | W:{data['wins']} L:{data['losses']} "
+        f"<p>Paper balance: ${data['balance']} | Completed: {data.get('completed_trades', data['wins'] + data['losses'])} "
+        f"| Wins: {data['wins']} | Losses: {data['losses']} "
         f"| Today: {data['trades_today']}/{MAX_TRADES_PER_DAY}</p>"
+        f"<p>Open position: {'YES' if state['position'] else 'NO'} | Log heartbeat: every {LOG_INTERVAL_SECONDS}s</p>"
         f"<p>Last: {data['last_signal']}</p>"
     )
 
@@ -524,7 +583,12 @@ def health():
 @app.route("/status")
 def status():
     with lock:
-        return jsonify({**latest, "open_position": state["position"] is not None,
+        completed = state["wins"] + state["losses"]
+        return jsonify({**latest, "completed_trades": completed,
+                        "win_rate_percent": round(100.0 * state["wins"] / completed, 2) if completed else 0.0,
+                        "open_position": state["position"] is not None,
+                        "position": state["position"],
+                        "trades_today_limit": MAX_TRADES_PER_DAY,
                         "paper_only": True, "minimum_score": MIN_SCORE})
 
 

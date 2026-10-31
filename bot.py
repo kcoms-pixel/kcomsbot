@@ -54,9 +54,16 @@ if not (1 <= MIN_SCORE <= 100):
 if not (0 < RISK_PERCENT <= 2):
     raise ValueError("RISK_PERCENT must be >0 and <=2")
 
-BASE_URLS = [
-    "https://fapi.binance.com",
-    "https://fapi1.binance.com",
+# Try USD-M Futures first, then public Spot market-data endpoints.
+# Spot endpoints are read-only fallbacks for price/candles; they never place orders.
+MARKET_ENDPOINTS = [
+    ("FUTURES", "https://fapi.binance.com"),
+    ("FUTURES", "https://fapi1.binance.com"),
+    ("SPOT", "https://api.binance.com"),
+    ("SPOT", "https://api1.binance.com"),
+    ("SPOT", "https://api2.binance.com"),
+    ("SPOT", "https://api3.binance.com"),
+    ("SPOT_DATA", "https://data-api.binance.vision"),
 ]
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "KCOMS-V7/1.0"})
@@ -71,7 +78,7 @@ log = logging.getLogger("KCOMS-V7")
 lock = threading.RLock()
 latest = {
     "bot": "KCOMS V7", "status": "BOOTING", "symbol": SYMBOL,
-    "price": 0.0, "bias": "NEUTRAL", "signal": "NONE", "score": 0,
+    "price": 0.0, "price_source": "NOT_CONNECTED", "bias": "NEUTRAL", "signal": "NONE", "score": 0,
     "wins": 0, "losses": 0, "completed_trades": 0, "trades_today": 0,
     "balance": PAPER_START_BALANCE, "last_signal": "Starting",
     "market_regime": "UNKNOWN", "last_error": "",
@@ -110,22 +117,44 @@ def send_tg(message: str) -> None:
 
 # ----------------------------- Market data -----------------------------
 def request_binance(path: str, params: dict) -> Optional[object]:
-    for base in BASE_URLS:
+    """Try Futures and Spot public market-data hosts; report the successful source."""
+    failures = []
+    for market_type, base in MARKET_ENDPOINTS:
+        # The data-api host is a Spot-only public data endpoint.
+        if market_type == "SPOT_DATA" and path.startswith("/fapi/"):
+            continue
+        request_path = path
+        if market_type in ("SPOT", "SPOT_DATA"):
+            if path == "/fapi/v1/ticker/price":
+                request_path = "/api/v3/ticker/price"
+            elif path == "/fapi/v1/klines":
+                request_path = "/api/v3/klines"
         try:
-            response = SESSION.get(base + path, params=params, timeout=8)
+            response = SESSION.get(base + request_path, params=params, timeout=5)
             response.raise_for_status()
-            return response.json()
+            payload = response.json()
+            if isinstance(payload, dict) and payload.get("code") not in (None, 0):
+                raise ValueError(f"Binance API {payload.get('code')}: {payload.get('msg')}")
+            latest["price_source"] = f"{market_type}:{base}"
+            latest["last_error"] = ""
+            return payload
         except (requests.RequestException, ValueError) as exc:
+            failures.append(f"{base}: {exc}")
             log.debug("Market-data endpoint %s failed: %s", base, exc)
+    latest["price_source"] = "UNAVAILABLE"
+    latest["last_error"] = " | ".join(failures[-3:]) or "No compatible Binance market-data endpoint"
     return None
 
 
 def get_price() -> Optional[float]:
     data = request_binance("/fapi/v1/ticker/price", {"symbol": SYMBOL})
     try:
-        return float(data["price"]) if isinstance(data, dict) else None
+        value = float(data["price"]) if isinstance(data, dict) else None
+        if value is not None and math.isfinite(value) and value > 0:
+            return value
     except (KeyError, TypeError, ValueError):
-        return None
+        pass
+    return None
 
 
 def get_klines(interval: str, limit: int = 250) -> Optional[List[dict]]:
@@ -152,7 +181,6 @@ def get_klines(interval: str, limit: int = 250) -> Optional[List[dict]]:
         return None
     candle_cache[interval] = {"time": now, "data": rows}
     return rows
-
 
 def closed_candles(rows: List[dict]) -> List[dict]:
     """Exclude the still-forming final candle using exchange close timestamp."""
@@ -462,13 +490,18 @@ def log_live_status(price: Optional[float], force: bool = False) -> None:
     price_text = f"{float(price):,.2f}" if price is not None else "UNAVAILABLE"
     cooldown_left = max(0, int(float(state["cooldown_until"]) - now))
     cooldown_text = f"{cooldown_left}s" if cooldown_left else "READY"
+    # Compact labels requested for easy reading in Render's log viewer:
+    # C=completed, W=wins, L=losses, B/L=paper balance, TRADES=opened today.
+    display_status = "IN_TRADE" if pos else (
+        "SCANNING" if status in ("SCANNING", "IN_POSITION") else status
+    )
     log.info(
-        "HEARTBEAT | BINANCE %s=%s | STATUS=%s | DIRECTION=%s | SCORE=%s/100 | "
-        "TRADES_TODAY=%s/%s | COMPLETED=%s | WINS=%s | LOSSES=%s | "
-        "WIN_RATE=%.1f%% | PAPER_BALANCE=$%.2f | OPEN_POSITION=%s | "
-        "UNREALIZED_PNL=$%+.4f | COOLDOWN=%s",
-        SYMBOL, price_text, status, latest.get("signal", "NONE"),
-        latest.get("score", 0), state["trades_today"], MAX_TRADES_PER_DAY,
+        "HEARTBEAT | BTCUSDT=%s | SOURCE=%s | STATUS=%s | DIR=%s | SCORE=%s/100 | "
+        "TRADES=%s/%s | C=%s | W=%s | L=%s | WIN_RATE=%.0f%% | B/L=$%.2f | "
+        "OPEN=%s | U_PNL=$%+.4f | COOLDOWN=%s",
+        price_text, latest.get("price_source", "UNKNOWN"), display_status,
+        latest.get("signal", "NONE"), latest.get("score", 0),
+        state["trades_today"], MAX_TRADES_PER_DAY,
         completed, state["wins"], state["losses"],
         (100.0 * state["wins"] / completed) if completed else 0.0,
         state["balance"], pos_text, unrealized, cooldown_text,
@@ -494,7 +527,8 @@ def run_bot() -> None:
                 price = get_price()
                 if price is None:
                     latest["status"] = "WAITING_FOR_PRICE"
-                    latest["last_error"] = "Binance price unavailable"
+                    latest["last_error"] = latest.get("last_error") or "Binance price unavailable"
+                    log.warning("BINANCE PRICE UNAVAILABLE | tried Futures and Spot public endpoints | %s", latest["last_error"])
                     log_live_status(None)
                     time.sleep(SCAN_INTERVAL)
                     continue
@@ -565,7 +599,7 @@ def home():
     return (
         "<h1>KCOMS V7</h1>"
         f"<p>{data['symbol']} | PAPER ONLY | Minimum score {MIN_SCORE}/100</p>"
-        f"<p>Status: {data['status']} | Price: {data['price']} | Bias: {data['bias']}</p>"
+        f"<p>Status: {data['status']} | Price: {data['price']} | Source: {data.get('price_source', 'UNKNOWN')} | Bias: {data['bias']}</p>"
         f"<p>Signal: {data['signal']} ({data['score']}/100) | Regime: {data['market_regime']}</p>"
         f"<p>Paper balance: ${data['balance']} | Completed: {data.get('completed_trades', data['wins'] + data['losses'])} "
         f"| Wins: {data['wins']} | Losses: {data['losses']} "

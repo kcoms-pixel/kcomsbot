@@ -1,4 +1,4 @@
-"""KCOMS V7.2 - multi-timeframe BTCUSDT signal engine with V6.7-compatible Binance price fallback.
+"""KCOMS V7.3 - multi-timeframe BTCUSDT signal engine with V6.7-compatible Binance price fallback.
 
 Paper-trading by default. Live execution is intentionally not implemented in this
 release; do not enable real orders until a separately tested Binance USD-M Futures
@@ -21,7 +21,7 @@ import math
 import os
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 
 import requests
@@ -71,24 +71,32 @@ PRICE_WS_URLS = [
     f"wss://data-stream.binance.vision/ws/{SYMBOL.lower()}@trade",
     f"wss://stream.binance.com:9443/ws/{SYMBOL.lower()}@trade",
 ]
+EAT = timezone(timedelta(hours=3), "EAT")  # East Africa Time (UTC+3)
+
+def current_clock() -> dict:
+    now = datetime.now(EAT)
+    return {"date": now.strftime("%Y-%m-%d"), "time": now.strftime("%H:%M:%S"),
+            "timezone": "EAT", "timestamp": now.isoformat()}
+
 price_lock = threading.RLock()
 price_feed = {"price": None, "received_at": 0.0, "source": "WAITING_FOR_BINANCE_SPOT"}
 ws_thread = None
 ws_stop = threading.Event()
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "Mozilla/5.0 (compatible; KCOMS-V7.2/1.0)"})
+SESSION.headers.update({"User-Agent": "Mozilla/5.0 (compatible; KCOMS-V7.3/1.0)"})
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
 )
-log = logging.getLogger("KCOMS-V7.2")
+log = logging.getLogger("KCOMS-V7.3")
 
 # ----------------------------- Runtime state -----------------------------
 lock = threading.RLock()
 latest = {
-    "bot": "KCOMS V7.2", "status": "BOOTING", "symbol": SYMBOL,
+    "bot": "KCOMS V7.3", "status": "BOOTING", "symbol": SYMBOL,
+    **current_clock(),
     "price": 0.0, "ema": 0.0, "price_source": "NOT_CONNECTED", "price_timestamp": None, "price_age_seconds": None, "bias": "NEUTRAL", "signal": "NONE", "score": 0,
     "wins": 0, "losses": 0, "completed_trades": 0, "trades_today": 0,
     "balance": PAPER_START_BALANCE, "last_signal": "Starting",
@@ -542,7 +550,7 @@ def open_paper_position(signal: dict) -> None:
     state["trades_today"] += 1
     save_state()
     msg = (
-        f"🟢 KCOMS V7.2 PAPER {signal['direction']} {SYMBOL}\n"
+        f"🟢 KCOMS V7.3 PAPER {signal['direction']} {SYMBOL}\nDate: {current_clock()['date']} EAT\n"
         f"Entry: {signal['price']:.2f}\nSL: {signal['stop']:.2f}\n"
         f"TP: {signal['target']:.2f}\nScore: {signal['score']}/100\n"
         f"Risk: ${risk_cash:.2f} | Notional: ${notional:.2f}\n"
@@ -579,7 +587,7 @@ def monitor_paper_position(price: float) -> None:
         state["losses"] += 1
         state["cooldown_until"] = time.time() + COOLDOWN_MINUTES * 60
     msg = (
-        f"{'✅' if pnl > 0 else '❌'} KCOMS V7.2 PAPER {result} {side}\n"
+        f"{'✅' if pnl > 0 else '❌'} KCOMS V7.3 PAPER {result} {side}\nDate: {current_clock()['date']} EAT\n"
         f"Exit: {exit_price:.2f}\nNet P/L: ${pnl:.4f} (estimated fees included)\n"
         f"Paper balance: ${state['balance']:.2f}\n"
         f"W:{state['wins']} L:{state['losses']}"
@@ -600,6 +608,7 @@ def log_live_status(price: Optional[float], force: bool = False) -> None:
     if not force and now - float(state.get("last_status_log", 0.0)) < LOG_INTERVAL_SECONDS:
         return
     state["last_status_log"] = now
+    latest.update(current_clock())
 
     # Use the 200-period EMA from completed Binance Spot 15m candles.
     ema_value = float(latest.get("ema") or 0.0)
@@ -618,17 +627,28 @@ def log_live_status(price: Optional[float], force: bool = False) -> None:
         price_text = "UNAVAILABLE"
 
     position = state.get("position")
-    status = "IN_TRADE" if position else latest.get("status", "SCANNING")
-    if status in ("IN_POSITION", "SCANNING", "BOOTING") and price is not None:
-        status = "SCANNING"
+    cooldown_remaining = max(0, int(float(state.get("cooldown_until", 0.0)) - now))
+    if position:
+        status = f"IN_TRADE_{position['side']}"
+        trade_detail = (f"ENTRY {float(position['entry']):.2f} | "
+                        f"SL {float(position['stop']):.2f} | TP {float(position['target']):.2f}")
+    elif cooldown_remaining > 0:
+        status = "COOLING"
+        trade_detail = f"COOLDOWN {cooldown_remaining}s remaining"
+    else:
+        status = latest.get("status", "SCANNING")
+        if status in ("IN_POSITION", "SCANNING", "BOOTING") and price is not None:
+            status = "SCANNING"
+        trade_detail = ""
     balance = float(state.get("balance", PAPER_START_BALANCE))
     wins = int(state.get("wins", 0))
     losses = int(state.get("losses", 0))
     trades = int(state.get("trades_today", 0))
     print(
-        f"[{datetime.now().strftime('%H:%M:%S')}] Price {price_text} | "
+        f"[{latest['date']} {latest['time']} EAT] Price {price_text} | "
         f"EMA {ema_value:.2f} | {status} | Bal ${balance:.2f} | "
-        f"W:{wins} L:{losses} D:{trades}/{MAX_TRADES_PER_DAY}",
+        f"W:{wins} L:{losses} D:{trades}/{MAX_TRADES_PER_DAY}"
+        f"{' | ' + trade_detail if trade_detail else ''}",
         flush=True,
     )
 
@@ -639,11 +659,11 @@ def run_bot() -> None:
     start_price_websocket_once()
     latest.update({"status": "SCANNING", "balance": round(state["balance"], 2)})
     send_tg(
-        f"🚀 KCOMS V7.2 ONLINE\n{SYMBOL} | LONG + SHORT\n"
+        f"🚀 KCOMS V7.3 ONLINE\nDate: {current_clock()['date']} EAT\n{SYMBOL} | LONG + SHORT\n"
         f"Minimum score: {MIN_SCORE}/100 | Paper trading only\n"
         f"Target RR: 1:{RR_TARGET} | Scan: {SCAN_INTERVAL}s"
     )
-    log.info("KCOMS V7.2 started: %s; minimum score %s; risk %.3f%%; daily trade limit %s; cooldown %sm; heartbeat every %ss", SYMBOL, MIN_SCORE, RISK_PERCENT, MAX_TRADES_PER_DAY, COOLDOWN_MINUTES, LOG_INTERVAL_SECONDS)
+    log.info("KCOMS V7.3 started: %s; minimum score %s; risk %.3f%%; daily trade limit %s; cooldown %sm; heartbeat every %ss", SYMBOL, MIN_SCORE, RISK_PERCENT, MAX_TRADES_PER_DAY, COOLDOWN_MINUTES, LOG_INTERVAL_SECONDS)
     log_live_status(None, force=True)
 
     while True:
@@ -689,7 +709,7 @@ def run_bot() -> None:
                 if analysis["confirmed"] and state["last_alert_key"] != alert_key:
                     state["last_alert_key"] = alert_key
                     send_tg(
-                        f"🔎 KCOMS V7.2 SETUP {analysis['direction']} {SYMBOL}\n"
+                        f"🔎 KCOMS V7.3 SETUP {analysis['direction']} {SYMBOL}\nDate: {current_clock()['date']} EAT\n"
                         f"Score: {analysis['score']}/100\nPrice: {price:.2f}\n"
                         f"Regime: {analysis['regime']}\n"
                         f"Evidence: {', '.join(analysis['reasons'])}"
@@ -721,9 +741,11 @@ def run_bot() -> None:
 @app.route("/")
 def home():
     with lock:
+        latest.update(current_clock())
         data = dict(latest)
     return (
-        "<h1>KCOMS V7.2</h1>"
+        "<h1>KCOMS V7.3</h1>"
+        f"<p>Date: {data['date']} | Time: {data['time']} {data['timezone']}</p>"
         f"<p>{data['symbol']} | BINANCE SPOT DATA | PAPER ONLY | Minimum score {MIN_SCORE}/100</p>"
         f"<p>Status: {data['status']} | Price: {data['price']} | Source: {data.get('price_source', 'UNKNOWN')} | Bias: {data['bias']}</p>"
         f"<p>Signal: {data['signal']} ({data['score']}/100) | Regime: {data['market_regime']}</p>"
@@ -731,24 +753,34 @@ def home():
         f"| Wins: {data['wins']} | Losses: {data['losses']} "
         f"| Today: {data['trades_today']}/{MAX_TRADES_PER_DAY}</p>"
         f"<p>Open position: {'YES' if state['position'] else 'NO'} | Log heartbeat: every {LOG_INTERVAL_SECONDS}s</p>"
+        f"<p>Trade details: {('SIDE ' + str(state['position']['side']) + ' | ENTRY ' + format(float(state['position']['entry']), '.2f') + ' | SL ' + format(float(state['position']['stop']), '.2f') + ' | TP ' + format(float(state['position']['target']), '.2f')) if state['position'] else ('COOLING: ' + str(max(0, int(float(state['cooldown_until']) - time.time()))) + ' seconds remaining' if float(state['cooldown_until']) > time.time() else 'No open trade / not cooling')}</p>"
         f"<p>Last: {data['last_signal']}</p>"
     )
 
 
 @app.route("/health")
 def health():
-    return jsonify({"ok": True, "bot": "KCOMS V7.2", "status": latest["status"]}), 200
+    latest.update(current_clock())
+    return jsonify({"ok": True, "bot": "KCOMS V7.3", "status": latest["status"], **current_clock()}), 200
 
 
 @app.route("/status")
 def status():
     with lock:
+        latest.update(current_clock())
         completed = state["wins"] + state["losses"]
         return jsonify({**latest, "completed_trades": completed,
                         "win_rate_percent": round(100.0 * state["wins"] / completed, 2) if completed else 0.0,
                         "open_position": state["position"] is not None,
                         "position": state["position"],
                         "trades_today_limit": MAX_TRADES_PER_DAY,
+                        "cooldown_active": time.time() < float(state["cooldown_until"]),
+                        "cooldown_remaining_seconds": max(0, int(float(state["cooldown_until"]) - time.time())),
+                        "trade_levels": ({"side": state["position"]["side"],
+                                         "entry": state["position"]["entry"],
+                                         "stop_loss": state["position"]["stop"],
+                                         "take_profit": state["position"]["target"]}
+                                        if state["position"] else None),
                         "paper_only": True, "minimum_score": MIN_SCORE})
 
 

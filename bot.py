@@ -8,7 +8,7 @@ Dependencies: pip install flask requests
 Environment:
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID (optional)
   SYMBOL=BTCUSDT
-  MIN_SCORE=80
+  MIN_SCORE=60
   PAPER_BALANCE=100
   PAPER_BALANCE_FILE=/tmp/kcoms_v7_balance.json
   SCAN_INTERVAL=1
@@ -30,7 +30,7 @@ from flask import Flask, jsonify
 # ----------------------------- Configuration -----------------------------
 app = Flask(__name__)
 SYMBOL = os.getenv("SYMBOL", "BTCUSDT").upper()
-MIN_SCORE = int(os.getenv("MIN_SCORE", "80"))
+MIN_SCORE = int(os.getenv("MIN_SCORE", "60"))
 SCAN_INTERVAL = max(1, int(os.getenv("SCAN_INTERVAL", "1")))
 LOG_INTERVAL_SECONDS = max(1, int(os.getenv("LOG_INTERVAL_SECONDS", "2")))
 MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "15"))

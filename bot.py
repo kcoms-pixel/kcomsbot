@@ -45,6 +45,9 @@ TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 TRADE_ENABLED = os.getenv("TRADE_ENABLED", "false").lower() == "true"
 PAPER_FEE_RATE = float(os.getenv("PAPER_FEE_RATE", "0.001"))  # estimated fee per side
 PRICE_STALE_SECONDS = max(3, int(os.getenv("PRICE_STALE_SECONDS", "10")))
+# Signal freshness windows: lower-timeframe confirmation may arrive after structure forms.
+CHOCH_VALID_30S_CANDLES = max(1, int(os.getenv("CHOCH_VALID_30S_CANDLES", "5")))
+STRUCTURE_VALID_5M_CANDLES = max(1, int(os.getenv("STRUCTURE_VALID_5M_CANDLES", "2")))
 
 if TRADE_ENABLED:
     raise RuntimeError(
@@ -118,7 +121,7 @@ state = {
 
 # Cached candles avoid requesting five full histories every second.
 candle_cache: Dict[str, Dict[str, object]] = {}
-CACHE_TTL = {"1m": 8, "5m": 20, "15m": 30, "1h": 60, "4h": 120}
+CACHE_TTL = {"1m": 8, "5m": 15, "15m": 30, "30m": 45, "1h": 60}
 
 # ----------------------------- Notifications -----------------------------
 def send_tg(message: str) -> None:
@@ -343,20 +346,22 @@ def trend_bias(candles: List[dict]) -> str:
 
 # ----------------------------- Signal analysis -----------------------------
 def analyse_market(current_price: Optional[float] = None) -> Optional[dict]:
-    data = {tf: get_klines(tf, 250) for tf in ("1m", "5m", "15m", "1h", "4h")}
+    # Binance Spot provides native 1m/5m/15m/30m/1h klines. The 30s
+    # CHOCH freshness window is counted from elapsed completed 30s intervals.
+    data = {tf: get_klines(tf, 250) for tf in ("1m", "5m", "15m", "30m", "1h")}
     if any(v is None for v in data.values()):
         return None
     candles = {tf: closed_candles(v) for tf, v in data.items()}  # type: ignore[arg-type]
-    if any(len(v) < 205 for v in (candles["15m"], candles["1h"], candles["4h"])):
+    if any(len(v) < 205 for v in (candles["15m"], candles["30m"], candles["1h"])):
         return None
-    c1, c5, c15, c1h, c4h = (candles[x] for x in ("1m", "5m", "15m", "1h", "4h"))
+    c1, c5, c15, c30, c1h = (candles[x] for x in ("1m", "5m", "15m", "30m", "1h"))
     price = current_price if current_price is not None else get_price()
     if price is None:
         return None
 
-    bias1h, bias4h = trend_bias(c1h), trend_bias(c4h)
+    bias30, bias1h = trend_bias(c30), trend_bias(c1h)
     bias15 = trend_bias(c15)
-    # Regime: EMA separation relative to ATR; low separation is treated as range.
+    # Preserve the existing volatility regime check on completed 15m candles.
     atr15 = atr(c15)
     closes15 = [x["c"] for x in c15]
     e20_15, e50_15 = ema(closes15, 20), ema(closes15, 50)
@@ -368,28 +373,54 @@ def analyse_market(current_price: Optional[float] = None) -> Optional[dict]:
     separation = abs(e20_15 - e50_15) / max(atr15, 1e-9)
     regime = "TRENDING" if separation >= 0.45 else "RANGING"
 
-    # 15m structural break: close beyond the prior 20 closed-candle range.
-    prior = c15[-21:-1]
-    prior_high = max(x["h"] for x in prior)
-    prior_low = min(x["l"] for x in prior)
-    last15 = c15[-1]
-    bos_long = last15["c"] > prior_high
-    bos_short = last15["c"] < prior_low
+    # 5m BOS and liquidity sweeps remain valid for a short rolling window.
+    bos_long = bos_short = sweep_high = sweep_low = False
+    bos_long_age = bos_short_age = sweep_high_age = sweep_low_age = None
+    first_recent_5 = max(20, len(c5) - STRUCTURE_VALID_5M_CANDLES - 1)
+    for idx in range(first_recent_5, len(c5)):
+        candle = c5[idx]
+        prior20 = c5[idx - 20:idx]
+        prior10 = c5[idx - 10:idx]
+        if len(prior20) < 20 or len(prior10) < 10:
+            continue
+        age = len(c5) - 1 - idx
+        if candle["c"] > max(x["h"] for x in prior20):
+            if bos_long_age is None or age < bos_long_age:
+                bos_long, bos_long_age = True, age
+        if candle["c"] < min(x["l"] for x in prior20):
+            if bos_short_age is None or age < bos_short_age:
+                bos_short, bos_short_age = True, age
+        swing_high = max(x["h"] for x in prior10)
+        swing_low = min(x["l"] for x in prior10)
+        if candle["h"] > swing_high and candle["c"] < swing_high:
+            if sweep_high_age is None or age < sweep_high_age:
+                sweep_high, sweep_high_age = True, age
+        if candle["l"] < swing_low and candle["c"] > swing_low:
+            if sweep_low_age is None or age < sweep_low_age:
+                sweep_low, sweep_low_age = True, age
 
-    # Liquidity sweep: pierce a recent 15m swing and close back inside the level.
-    swing = c15[-11:-1]
-    swing_high = max(x["h"] for x in swing)
-    swing_low = min(x["l"] for x in swing)
-    sweep_high = last15["h"] > swing_high and last15["c"] < swing_high
-    sweep_low = last15["l"] < swing_low and last15["c"] > swing_low
+    # 1m CHOCH remains active for five completed 30s intervals after it forms.
+    choch_up = choch_down = False
+    choch_up_age = choch_down_age = None
+    now_ms = int(time.time() * 1000)
+    latest_30s_close_ms = (now_ms // 30000) * 30000
+    first_recent_1 = max(6, len(c1) - 7)
+    for idx in range(first_recent_1, len(c1)):
+        candle = c1[idx]
+        micro = c1[idx - 6:idx]
+        if len(micro) < 6:
+            continue
+        age_30s = max(0, (latest_30s_close_ms - candle["close_time"]) // 30000)
+        if age_30s > CHOCH_VALID_30S_CANDLES:
+            continue
+        if candle["c"] > max(x["h"] for x in micro) and candle["c"] > candle["o"]:
+            if choch_up_age is None or age_30s < choch_up_age:
+                choch_up, choch_up_age = True, age_30s
+        if candle["c"] < min(x["l"] for x in micro) and candle["c"] < candle["o"]:
+            if choch_down_age is None or age_30s < choch_down_age:
+                choch_down, choch_down_age = True, age_30s
 
-    # 5m CHOCH proxy: close breaks the recent opposite-side micro structure.
-    last5 = c5[-1]
-    micro5 = c5[-7:-1]
-    choch_up = last5["c"] > max(x["h"] for x in micro5) and last5["c"] > last5["o"]
-    choch_down = last5["c"] < min(x["l"] for x in micro5) and last5["c"] < last5["o"]
-
-    # 1m trigger: close breaks recent micro range with body-direction confirmation.
+    # The latest completed 1m candle must still provide the actual entry trigger.
     last1 = c1[-1]
     micro1 = c1[-6:-1]
     trigger_up = last1["c"] > max(x["h"] for x in micro1) and last1["c"] > last1["o"]
@@ -400,33 +431,30 @@ def analyse_market(current_price: Optional[float] = None) -> Optional[dict]:
     volume_ok = avg_vol > 0 and last1["v"] >= avg_vol * 1.15
     atr1 = atr(c1)
 
-    # Score each side. Trend alignment and distinct confirmation stages are weighted.
     def score_side(side: str) -> Tuple[int, List[str]]:
         points, reasons = 0, []
         if side == "LONG":
-            if bias4h == "BULLISH": points += 8; reasons.append("4H bullish")
-            if bias1h == "BULLISH": points += 7; reasons.append("1H bullish")
-            if bias15 == "BULLISH" and bos_long: points += 15; reasons.append("15M bullish BOS")
-            if sweep_low: points += 20; reasons.append("sell-side sweep/reclaim")
-            if choch_up: points += 15; reasons.append("5M bullish CHOCH")
+            if bias1h == "BULLISH": points += 8; reasons.append("1H bullish")
+            if bias30 == "BULLISH": points += 7; reasons.append("30M bullish")
+            if bos_long: points += 15; reasons.append(f"recent 5M bullish BOS (age {bos_long_age})")
+            if sweep_low: points += 20; reasons.append(f"recent 5M sell-side sweep/reclaim (age {sweep_low_age})")
+            if choch_up: points += 15; reasons.append(f"1M bullish CHOCH active ({choch_up_age}/{CHOCH_VALID_30S_CANDLES} completed 30s candles)")
             if trigger_up: points += 15; reasons.append("1M bullish trigger")
-            # FVG proxy: three-candle imbalance; use as confluence, not a standalone entry.
             if len(c15) >= 3 and c15[-1]["l"] > c15[-3]["h"]:
                 points += 10; reasons.append("15M bullish FVG")
             if volume_ok and rsi1 is not None and 50 <= rsi1 <= 72:
                 points += 5; reasons.append("volume/momentum confirmation")
         else:
-            if bias4h == "BEARISH": points += 8; reasons.append("4H bearish")
-            if bias1h == "BEARISH": points += 7; reasons.append("1H bearish")
-            if bias15 == "BEARISH" and bos_short: points += 15; reasons.append("15M bearish BOS")
-            if sweep_high: points += 20; reasons.append("buy-side sweep/rejection")
-            if choch_down: points += 15; reasons.append("5M bearish CHOCH")
+            if bias1h == "BEARISH": points += 8; reasons.append("1H bearish")
+            if bias30 == "BEARISH": points += 7; reasons.append("30M bearish")
+            if bos_short: points += 15; reasons.append(f"recent 5M bearish BOS (age {bos_short_age})")
+            if sweep_high: points += 20; reasons.append(f"recent 5M buy-side sweep/rejection (age {sweep_high_age})")
+            if choch_down: points += 15; reasons.append(f"1M bearish CHOCH active ({choch_down_age}/{CHOCH_VALID_30S_CANDLES} completed 30s candles)")
             if trigger_down: points += 15; reasons.append("1M bearish trigger")
             if len(c15) >= 3 and c15[-1]["h"] < c15[-3]["l"]:
                 points += 10; reasons.append("15M bearish FVG")
             if volume_ok and rsi1 is not None and 28 <= rsi1 <= 50:
                 points += 5; reasons.append("volume/momentum confirmation")
-        # Five points for a viable volatility-adjusted stop and at least 2R room.
         if atr1 and atr1 > 0 and regime == "TRENDING":
             points += 5; reasons.append("volatility/risk conditions acceptable")
         return min(points, 100), reasons
@@ -438,18 +466,17 @@ def analyse_market(current_price: Optional[float] = None) -> Optional[dict]:
     else:
         direction, score, reasons = "SHORT", short_score, short_reasons
 
-    # Require trend agreement, structural/sweep/CHOCH/trigger confluence and minimum score.
+    # 30m is the directional trend filter; 1h must not oppose it.
     hard_confirm = (
-        (direction == "LONG" and bias1h == "BULLISH" and bias4h != "BEARISH"
+        (direction == "LONG" and bias30 == "BULLISH" and bias1h != "BEARISH"
          and (sweep_low or bos_long) and choch_up and trigger_up)
         or
-        (direction == "SHORT" and bias1h == "BEARISH" and bias4h != "BULLISH"
+        (direction == "SHORT" and bias30 == "BEARISH" and bias1h != "BULLISH"
          and (sweep_high or bos_short) and choch_down and trigger_down)
     )
     if regime == "RANGING":
         hard_confirm = False
 
-    # Swing/ATR stop placement; avoid an arbitrarily fixed dollar buffer.
     if direction == "LONG":
         swing_stop = min(x["l"] for x in c1[-8:]) - (0.25 * (atr1 or 0))
         stop = min(swing_stop, price - 1.2 * (atr1 or 0))
@@ -459,8 +486,6 @@ def analyse_market(current_price: Optional[float] = None) -> Optional[dict]:
         stop = max(swing_stop, price + 1.2 * (atr1 or 0))
         risk_distance = stop - price
     target = price + RR_TARGET * risk_distance if direction == "LONG" else price - RR_TARGET * risk_distance
-
-    # Ensure risk is neither tiny nor absurdly wide versus current ATR.
     risk_ok = bool(atr1 and risk_distance >= 0.8 * atr1 and risk_distance <= 3.5 * atr1)
     if not risk_ok:
         score = min(score, MIN_SCORE - 1)
@@ -472,8 +497,15 @@ def analyse_market(current_price: Optional[float] = None) -> Optional[dict]:
     return {
         "price": price, "direction": direction, "score": score,
         "long_score": long_score, "short_score": short_score,
-        "reasons": reasons, "bias_1h": bias1h, "bias_4h": bias4h,
+        "reasons": reasons, "bias_30m": bias30, "bias_1h": bias1h,
         "bias_15m": bias15, "regime": regime, "atr_1m": atr1,
+        "confirmation_windows": {
+            "choch_valid_30s_candles": CHOCH_VALID_30S_CANDLES,
+            "structure_valid_5m_candles": STRUCTURE_VALID_5M_CANDLES,
+            "choch_up_age_30s": choch_up_age, "choch_down_age_30s": choch_down_age,
+            "bos_long_age_5m": bos_long_age, "bos_short_age_5m": bos_short_age,
+            "sweep_low_age_5m": sweep_low_age, "sweep_high_age_5m": sweep_high_age,
+        },
         "stop": stop, "target": target, "risk_distance": risk_distance,
         "confirmed": hard_confirm and risk_ok and score >= MIN_SCORE,
         "candle_key": c1[-1]["open_time"],
@@ -660,6 +692,8 @@ def run_bot() -> None:
     latest.update({"status": "SCANNING", "balance": round(state["balance"], 2)})
     send_tg(
         f"🚀 KCOMS V7.3 ONLINE\nDate: {current_clock()['date']} EAT\n{SYMBOL} | LONG + SHORT\n"
+        f"Trend: 30M + 1H | BOS/Sweep: 5M | CHOCH: 1M\n"
+        f"CHOCH validity: {CHOCH_VALID_30S_CANDLES} completed 30s candles\n"
         f"Minimum score: {MIN_SCORE}/100 | Paper trading only\n"
         f"Target RR: 1:{RR_TARGET} | Scan: {SCAN_INTERVAL}s"
     )
@@ -695,7 +729,7 @@ def run_bot() -> None:
 
                 latest.update({
                     "status": "IN_POSITION" if state["position"] else "SCANNING",
-                    "price": round(price, 2), "bias": analysis["bias_1h"],
+                    "price": round(price, 2), "bias": analysis["bias_30m"],
                     "signal": analysis["direction"], "score": analysis["score"],
                     "market_regime": analysis["regime"],
                     "wins": state["wins"], "losses": state["losses"],

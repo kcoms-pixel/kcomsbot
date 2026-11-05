@@ -1,4 +1,4 @@
-"""KCOMS V7.3 - multi-timeframe BTCUSDT signal engine with V6.7-compatible Binance price fallback.
+"""KCOMS V7.4 - multi-timeframe BTCUSDT signal engine with V6.7-compatible Binance price fallback.
 
 Paper-trading by default. Live execution is intentionally not implemented in this
 release; do not enable real orders until a separately tested Binance USD-M Futures
@@ -87,23 +87,23 @@ ws_thread = None
 ws_stop = threading.Event()
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "Mozilla/5.0 (compatible; KCOMS-V7.3/1.0)"})
+SESSION.headers.update({"User-Agent": "Mozilla/5.0 (compatible; KCOMS-V7.4/1.0)"})
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
 )
-log = logging.getLogger("KCOMS-V7.3")
+log = logging.getLogger("KCOMS-V7.4")
 
 # ----------------------------- Runtime state -----------------------------
 lock = threading.RLock()
 latest = {
-    "bot": "KCOMS V7.3", "status": "BOOTING", "symbol": SYMBOL,
+    "bot": "KCOMS V7.4", "status": "BOOTING", "symbol": SYMBOL,
     **current_clock(),
     "price": 0.0, "ema": 0.0, "price_source": "NOT_CONNECTED", "price_timestamp": None, "price_age_seconds": None, "bias": "NEUTRAL", "signal": "NONE", "score": 0,
     "wins": 0, "losses": 0, "completed_trades": 0, "trades_today": 0,
     "balance": PAPER_START_BALANCE, "last_signal": "Starting",
-    "market_regime": "UNKNOWN", "last_error": "",
+    "market_regime": "UNKNOWN", "entry_status": "WAITING", "rejection_reasons": [], "long_score": 0, "short_score": 0, "entry_trigger": "NONE", "last_error": "",
 }
 state = {
     "balance": PAPER_START_BALANCE,
@@ -117,6 +117,9 @@ state = {
     "last_alert_key": None,
     "last_trade_key": None,
     "last_status_log": 0.0,
+    "last_diagnostic_key": None,
+    "rejection_counts": {},
+    "recent_rejections": [],
 }
 
 # Cached candles avoid requesting five full histories every second.
@@ -345,6 +348,30 @@ def trend_bias(candles: List[dict]) -> str:
     return "NEUTRAL"
 
 # ----------------------------- Signal analysis -----------------------------
+def entry_confirmation(direction: str, bias30: str, regime: str,
+                       side_sweep: bool, side_bos: bool, side_choch: bool,
+                       side_trigger: bool) -> Tuple[bool, List[str]]:
+    """Return hard-gate result and transparent reasons for the selected side."""
+    is_long = direction == "LONG"
+    expected = "BULLISH" if is_long else "BEARISH"
+    opposite = "BEARISH" if is_long else "BULLISH"
+    rejected = []
+    if bias30 == opposite:
+        rejected.append("30M trend opposes setup")
+    if not side_choch:
+        rejected.append("no fresh 1M CHOCH")
+    if not side_trigger:
+        rejected.append("no current 1M breakout or retest/reclaim trigger")
+    if regime == "TRENDING" and not (side_sweep or side_bos):
+        rejected.append("no recent 5M BOS or liquidity sweep")
+    if regime == "RANGING" and not side_sweep:
+        rejected.append("range entry requires a 5M liquidity sweep")
+    trend_context_ok = bias30 == expected or (bias30 == "NEUTRAL" and regime == "RANGING" and side_sweep)
+    structure_ok = (side_sweep or side_bos) if regime == "TRENDING" else side_sweep
+    confirmed = trend_context_ok and structure_ok and side_choch and side_trigger
+    return confirmed, rejected
+
+
 def analyse_market(current_price: Optional[float] = None) -> Optional[dict]:
     # Binance Spot provides native 1m/5m/15m/30m/1h klines. The 30s
     # CHOCH freshness window is counted from elapsed completed 30s intervals.
@@ -361,7 +388,7 @@ def analyse_market(current_price: Optional[float] = None) -> Optional[dict]:
 
     bias30, bias1h = trend_bias(c30), trend_bias(c1h)
     bias15 = trend_bias(c15)
-    # Preserve the existing volatility regime check on completed 15m candles.
+    # Keep the 15m volatility classification as context, not as a blanket veto.
     atr15 = atr(c15)
     closes15 = [x["c"] for x in c15]
     e20_15, e50_15 = ema(closes15, 20), ema(closes15, 50)
@@ -373,7 +400,7 @@ def analyse_market(current_price: Optional[float] = None) -> Optional[dict]:
     separation = abs(e20_15 - e50_15) / max(atr15, 1e-9)
     regime = "TRENDING" if separation >= 0.45 else "RANGING"
 
-    # 5m BOS and liquidity sweeps remain valid for a short rolling window.
+    # Recent 5m BOS and liquidity sweeps remain eligible for two completed 5m candles.
     bos_long = bos_short = sweep_high = sweep_low = False
     bos_long_age = bos_short_age = sweep_high_age = sweep_low_age = None
     first_recent_5 = max(20, len(c5) - STRUCTURE_VALID_5M_CANDLES - 1)
@@ -420,44 +447,73 @@ def analyse_market(current_price: Optional[float] = None) -> Optional[dict]:
             if choch_down_age is None or age_30s < choch_down_age:
                 choch_down, choch_down_age = True, age_30s
 
-    # The latest completed 1m candle must still provide the actual entry trigger.
+    # Entry trigger: accept a fresh breakout OR a breakout retest/reclaim.
     last1 = c1[-1]
     micro1 = c1[-6:-1]
-    trigger_up = last1["c"] > max(x["h"] for x in micro1) and last1["c"] > last1["o"]
-    trigger_down = last1["c"] < min(x["l"] for x in micro1) and last1["c"] < last1["o"]
+    trigger_up_breakout = last1["c"] > max(x["h"] for x in micro1) and last1["c"] > last1["o"]
+    trigger_down_breakout = last1["c"] < min(x["l"] for x in micro1) and last1["c"] < last1["o"]
+    atr1 = atr(c1)
+    retest_tolerance = 0.15 * (atr1 or 0.0)
+    trigger_up_retest = trigger_down_retest = False
+    retest_up_level = retest_down_level = None
+    # Look for a breakout in the preceding three completed 1m candles, then a retest.
+    for idx in range(max(5, len(c1) - 4), len(c1) - 1):
+        prior = c1[idx - 5:idx]
+        if len(prior) < 5:
+            continue
+        level_up = max(x["h"] for x in prior)
+        level_down = min(x["l"] for x in prior)
+        breakout = c1[idx]
+        if breakout["c"] > level_up and breakout["c"] > breakout["o"]:
+            if last1["l"] <= level_up + retest_tolerance and last1["c"] > level_up and last1["c"] > last1["o"]:
+                trigger_up_retest, retest_up_level = True, level_up
+        if breakout["c"] < level_down and breakout["c"] < breakout["o"]:
+            if last1["h"] >= level_down - retest_tolerance and last1["c"] < level_down and last1["c"] < last1["o"]:
+                trigger_down_retest, retest_down_level = True, level_down
+    trigger_up = trigger_up_breakout or trigger_up_retest
+    trigger_down = trigger_down_breakout or trigger_down_retest
 
     rsi1 = rsi([x["c"] for x in c1], 14)
     avg_vol = sum(x["v"] for x in c1[-21:-1]) / 20
     volume_ok = avg_vol > 0 and last1["v"] >= avg_vol * 1.15
-    atr1 = atr(c1)
 
     def score_side(side: str) -> Tuple[int, List[str]]:
         points, reasons = 0, []
         if side == "LONG":
-            if bias1h == "BULLISH": points += 8; reasons.append("1H bullish")
-            if bias30 == "BULLISH": points += 7; reasons.append("30M bullish")
+            if bias30 == "BULLISH": points += 12; reasons.append("30M bullish primary trend")
+            elif bias30 == "NEUTRAL": points += 5; reasons.append("30M neutral; range reversal permitted with sweep")
+            else: points -= 10; reasons.append("30M bearish against LONG")
+            if bias1h == "BULLISH": points += 6; reasons.append("1H bullish alignment")
+            elif bias1h == "BEARISH": points -= 4; reasons.append("1H bearish headwind (not an automatic veto)")
             if bos_long: points += 15; reasons.append(f"recent 5M bullish BOS (age {bos_long_age})")
             if sweep_low: points += 20; reasons.append(f"recent 5M sell-side sweep/reclaim (age {sweep_low_age})")
             if choch_up: points += 15; reasons.append(f"1M bullish CHOCH active ({choch_up_age}/{CHOCH_VALID_30S_CANDLES} completed 30s candles)")
-            if trigger_up: points += 15; reasons.append("1M bullish trigger")
+            if trigger_up_breakout: points += 15; reasons.append("1M bullish breakout trigger")
+            elif trigger_up_retest: points += 15; reasons.append("1M bullish retest/reclaim trigger")
             if len(c15) >= 3 and c15[-1]["l"] > c15[-3]["h"]:
-                points += 10; reasons.append("15M bullish FVG")
-            if volume_ok and rsi1 is not None and 50 <= rsi1 <= 72:
+                points += 8; reasons.append("15M bullish FVG")
+            if volume_ok and rsi1 is not None and 48 <= rsi1 <= 74:
                 points += 5; reasons.append("volume/momentum confirmation")
         else:
-            if bias1h == "BEARISH": points += 8; reasons.append("1H bearish")
-            if bias30 == "BEARISH": points += 7; reasons.append("30M bearish")
+            if bias30 == "BEARISH": points += 12; reasons.append("30M bearish primary trend")
+            elif bias30 == "NEUTRAL": points += 5; reasons.append("30M neutral; range reversal permitted with sweep")
+            else: points -= 10; reasons.append("30M bullish against SHORT")
+            if bias1h == "BEARISH": points += 6; reasons.append("1H bearish alignment")
+            elif bias1h == "BULLISH": points -= 4; reasons.append("1H bullish headwind (not an automatic veto)")
             if bos_short: points += 15; reasons.append(f"recent 5M bearish BOS (age {bos_short_age})")
             if sweep_high: points += 20; reasons.append(f"recent 5M buy-side sweep/rejection (age {sweep_high_age})")
             if choch_down: points += 15; reasons.append(f"1M bearish CHOCH active ({choch_down_age}/{CHOCH_VALID_30S_CANDLES} completed 30s candles)")
-            if trigger_down: points += 15; reasons.append("1M bearish trigger")
+            if trigger_down_breakout: points += 15; reasons.append("1M bearish breakout trigger")
+            elif trigger_down_retest: points += 15; reasons.append("1M bearish retest/reclaim trigger")
             if len(c15) >= 3 and c15[-1]["h"] < c15[-3]["l"]:
-                points += 10; reasons.append("15M bearish FVG")
-            if volume_ok and rsi1 is not None and 28 <= rsi1 <= 50:
+                points += 8; reasons.append("15M bearish FVG")
+            if volume_ok and rsi1 is not None and 26 <= rsi1 <= 52:
                 points += 5; reasons.append("volume/momentum confirmation")
         if atr1 and atr1 > 0 and regime == "TRENDING":
-            points += 5; reasons.append("volatility/risk conditions acceptable")
-        return min(points, 100), reasons
+            points += 5; reasons.append("trending volatility conditions")
+        elif regime == "RANGING" and (sweep_low if side == "LONG" else sweep_high):
+            points += 5; reasons.append("range reversal supported by liquidity sweep")
+        return max(0, min(points, 100)), reasons
 
     long_score, long_reasons = score_side("LONG")
     short_score, short_reasons = score_side("SHORT")
@@ -466,18 +522,20 @@ def analyse_market(current_price: Optional[float] = None) -> Optional[dict]:
     else:
         direction, score, reasons = "SHORT", short_score, short_reasons
 
-    # 30m is the directional trend filter; 1h must not oppose it.
-    hard_confirm = (
-        (direction == "LONG" and bias30 == "BULLISH" and bias1h != "BEARISH"
-         and (sweep_low or bos_long) and choch_up and trigger_up)
-        or
-        (direction == "SHORT" and bias30 == "BEARISH" and bias1h != "BULLISH"
-         and (sweep_high or bos_short) and choch_down and trigger_down)
+    is_long = direction == "LONG"
+    aligned_30 = bias30 == ("BULLISH" if is_long else "BEARISH")
+    neutral_30 = bias30 == "NEUTRAL"
+    side_sweep = sweep_low if is_long else sweep_high
+    side_bos = bos_long if is_long else bos_short
+    side_choch = choch_up if is_long else choch_down
+    side_trigger = trigger_up if is_long else trigger_down
+    # In trends, accept either BOS or sweep. In ranges, demand a sweep reversal.
+    # 1H is a scoring preference only; 30M remains the directional gate.
+    hard_confirm, rejection_reasons = entry_confirmation(
+        direction, bias30, regime, side_sweep, side_bos, side_choch, side_trigger
     )
-    if regime == "RANGING":
-        hard_confirm = False
 
-    if direction == "LONG":
+    if is_long:
         swing_stop = min(x["l"] for x in c1[-8:]) - (0.25 * (atr1 or 0))
         stop = min(swing_stop, price - 1.2 * (atr1 or 0))
         risk_distance = price - stop
@@ -485,19 +543,24 @@ def analyse_market(current_price: Optional[float] = None) -> Optional[dict]:
         swing_stop = max(x["h"] for x in c1[-8:]) + (0.25 * (atr1 or 0))
         stop = max(swing_stop, price + 1.2 * (atr1 or 0))
         risk_distance = stop - price
-    target = price + RR_TARGET * risk_distance if direction == "LONG" else price - RR_TARGET * risk_distance
+    target = price + RR_TARGET * risk_distance if is_long else price - RR_TARGET * risk_distance
     risk_ok = bool(atr1 and risk_distance >= 0.8 * atr1 and risk_distance <= 3.5 * atr1)
     if not risk_ok:
-        score = min(score, MIN_SCORE - 1)
-        reasons.append("rejected: stop distance outside ATR limits")
-    if not hard_confirm:
-        score = min(score, MIN_SCORE - 1)
-        reasons.append("rejected: required confirmations not aligned")
+        rejection_reasons.append("stop distance outside ATR risk limits")
+    if score < MIN_SCORE:
+        rejection_reasons.append(f"score {score} below minimum {MIN_SCORE}")
+    confirmed = hard_confirm and risk_ok and score >= MIN_SCORE
+    if not confirmed and not rejection_reasons:
+        rejection_reasons.append("setup did not pass all entry gates")
 
     return {
         "price": price, "direction": direction, "score": score,
         "long_score": long_score, "short_score": short_score,
-        "reasons": reasons, "bias_30m": bias30, "bias_1h": bias1h,
+        "reasons": reasons, "rejection_reasons": rejection_reasons,
+        "entry_trigger": ("BREAKOUT" if (trigger_up_breakout if is_long else trigger_down_breakout)
+                          else "RETEST_RECLAIM" if (trigger_up_retest if is_long else trigger_down_retest)
+                          else "NONE"),
+        "bias_30m": bias30, "bias_1h": bias1h,
         "bias_15m": bias15, "regime": regime, "atr_1m": atr1,
         "confirmation_windows": {
             "choch_valid_30s_candles": CHOCH_VALID_30S_CANDLES,
@@ -507,7 +570,7 @@ def analyse_market(current_price: Optional[float] = None) -> Optional[dict]:
             "sweep_low_age_5m": sweep_low_age, "sweep_high_age_5m": sweep_high_age,
         },
         "stop": stop, "target": target, "risk_distance": risk_distance,
-        "confirmed": hard_confirm and risk_ok and score >= MIN_SCORE,
+        "confirmed": confirmed,
         "candle_key": c1[-1]["open_time"],
     }
 
@@ -582,7 +645,7 @@ def open_paper_position(signal: dict) -> None:
     state["trades_today"] += 1
     save_state()
     msg = (
-        f"🟢 KCOMS V7.3 PAPER {signal['direction']} {SYMBOL}\nDate: {current_clock()['date']} EAT\n"
+        f"🟢 KCOMS V7.4 PAPER {signal['direction']} {SYMBOL}\nDate: {current_clock()['date']} EAT\n"
         f"Entry: {signal['price']:.2f}\nSL: {signal['stop']:.2f}\n"
         f"TP: {signal['target']:.2f}\nScore: {signal['score']}/100\n"
         f"Risk: ${risk_cash:.2f} | Notional: ${notional:.2f}\n"
@@ -619,7 +682,7 @@ def monitor_paper_position(price: float) -> None:
         state["losses"] += 1
         state["cooldown_until"] = time.time() + COOLDOWN_MINUTES * 60
     msg = (
-        f"{'✅' if pnl > 0 else '❌'} KCOMS V7.3 PAPER {result} {side}\nDate: {current_clock()['date']} EAT\n"
+        f"{'✅' if pnl > 0 else '❌'} KCOMS V7.4 PAPER {result} {side}\nDate: {current_clock()['date']} EAT\n"
         f"Exit: {exit_price:.2f}\nNet P/L: ${pnl:.4f} (estimated fees included)\n"
         f"Paper balance: ${state['balance']:.2f}\n"
         f"W:{state['wins']} L:{state['losses']}"
@@ -691,13 +754,14 @@ def run_bot() -> None:
     start_price_websocket_once()
     latest.update({"status": "SCANNING", "balance": round(state["balance"], 2)})
     send_tg(
-        f"🚀 KCOMS V7.3 ONLINE\nDate: {current_clock()['date']} EAT\n{SYMBOL} | LONG + SHORT\n"
-        f"Trend: 30M + 1H | BOS/Sweep: 5M | CHOCH: 1M\n"
+        f"🚀 KCOMS V7.4 ONLINE\nDate: {current_clock()['date']} EAT\n{SYMBOL} | LONG + SHORT\n"
+        f"Trend: 30M primary + 1H preference | BOS/Sweep: 5M | CHOCH: 1M\n"
+        f"Entry: 1M breakout or retest/reclaim | Range reversals require 5M sweep\n"
         f"CHOCH validity: {CHOCH_VALID_30S_CANDLES} completed 30s candles\n"
-        f"Minimum score: {MIN_SCORE}/100 | Paper trading only\n"
+        f"Minimum score: {MIN_SCORE}/100 | Adaptive entries | Paper trading only\n"
         f"Target RR: 1:{RR_TARGET} | Scan: {SCAN_INTERVAL}s"
     )
-    log.info("KCOMS V7.3 started: %s; minimum score %s; risk %.3f%%; daily trade limit %s; cooldown %sm; heartbeat every %ss", SYMBOL, MIN_SCORE, RISK_PERCENT, MAX_TRADES_PER_DAY, COOLDOWN_MINUTES, LOG_INTERVAL_SECONDS)
+    log.info("KCOMS V7.4 started: %s; minimum score %s; risk %.3f%%; daily trade limit %s; cooldown %sm; heartbeat every %ss", SYMBOL, MIN_SCORE, RISK_PERCENT, MAX_TRADES_PER_DAY, COOLDOWN_MINUTES, LOG_INTERVAL_SECONDS)
     log_live_status(None, force=True)
 
     while True:
@@ -727,11 +791,34 @@ def run_bot() -> None:
                     time.sleep(SCAN_INTERVAL)
                     continue
 
+                # Record one diagnostic sample per completed 1m candle (not every scan).
+                if state.get("last_diagnostic_key") != analysis["candle_key"]:
+                    state["last_diagnostic_key"] = analysis["candle_key"]
+                    if not analysis["confirmed"]:
+                        for reason in analysis["rejection_reasons"]:
+                            counts = state.setdefault("rejection_counts", {})
+                            counts[reason] = int(counts.get(reason, 0)) + 1
+                    recent = state.setdefault("recent_rejections", [])
+                    recent.append({
+                        "time": current_clock()["timestamp"],
+                        "direction": analysis["direction"],
+                        "score": analysis["score"],
+                        "confirmed": analysis["confirmed"],
+                        "reasons": analysis["rejection_reasons"],
+                    })
+                    state["recent_rejections"] = recent[-20:]
+
                 latest.update({
                     "status": "IN_POSITION" if state["position"] else "SCANNING",
                     "price": round(price, 2), "bias": analysis["bias_30m"],
                     "signal": analysis["direction"], "score": analysis["score"],
                     "market_regime": analysis["regime"],
+                    "entry_status": "CONFIRMED" if analysis["confirmed"] else "REJECTED",
+                    "rejection_reasons": analysis["rejection_reasons"],
+                    "long_score": analysis["long_score"], "short_score": analysis["short_score"],
+                    "entry_trigger": analysis["entry_trigger"],
+                    "rejection_counts": dict(state.get("rejection_counts", {})),
+                    "recent_rejections": list(state.get("recent_rejections", [])),
                     "wins": state["wins"], "losses": state["losses"],
                     "completed_trades": state["wins"] + state["losses"],
                     "trades_today": state["trades_today"],
@@ -743,7 +830,7 @@ def run_bot() -> None:
                 if analysis["confirmed"] and state["last_alert_key"] != alert_key:
                     state["last_alert_key"] = alert_key
                     send_tg(
-                        f"🔎 KCOMS V7.3 SETUP {analysis['direction']} {SYMBOL}\nDate: {current_clock()['date']} EAT\n"
+                        f"🔎 KCOMS V7.4 SETUP {analysis['direction']} {SYMBOL}\nDate: {current_clock()['date']} EAT\n"
                         f"Score: {analysis['score']}/100\nPrice: {price:.2f}\n"
                         f"Regime: {analysis['regime']}\n"
                         f"Evidence: {', '.join(analysis['reasons'])}"
@@ -778,11 +865,14 @@ def home():
         latest.update(current_clock())
         data = dict(latest)
     return (
-        "<h1>KCOMS V7.3</h1>"
+        "<h1>KCOMS V7.4</h1>"
         f"<p>Date: {data['date']} | Time: {data['time']} {data['timezone']}</p>"
         f"<p>{data['symbol']} | BINANCE SPOT DATA | PAPER ONLY | Minimum score {MIN_SCORE}/100</p>"
         f"<p>Status: {data['status']} | Price: {data['price']} | Source: {data.get('price_source', 'UNKNOWN')} | Bias: {data['bias']}</p>"
-        f"<p>Signal: {data['signal']} ({data['score']}/100) | Regime: {data['market_regime']}</p>"
+        f"<p>Signal: {data['signal']} ({data['score']}/100) | Regime: {data['market_regime']} | Entry: {data.get('entry_status', 'WAITING')} | Trigger: {data.get('entry_trigger', 'NONE')}</p>"
+        f"<p>LONG score: {data.get('long_score', 0)} | SHORT score: {data.get('short_score', 0)}</p>"
+        f"<p>Rejection reasons: {', '.join(data.get('rejection_reasons', [])) or 'None'}</p>"
+        f"<p>Rejection counts: {data.get('rejection_counts', {})}</p>"
         f"<p>Paper balance: ${data['balance']} | Completed: {data.get('completed_trades', data['wins'] + data['losses'])} "
         f"| Wins: {data['wins']} | Losses: {data['losses']} "
         f"| Today: {data['trades_today']}/{MAX_TRADES_PER_DAY}</p>"
@@ -795,7 +885,7 @@ def home():
 @app.route("/health")
 def health():
     latest.update(current_clock())
-    return jsonify({"ok": True, "bot": "KCOMS V7.3", "status": latest["status"], **current_clock()}), 200
+    return jsonify({"ok": True, "bot": "KCOMS V7.4", "status": latest["status"], **current_clock()}), 200
 
 
 @app.route("/status")
@@ -815,7 +905,9 @@ def status():
                                          "stop_loss": state["position"]["stop"],
                                          "take_profit": state["position"]["target"]}
                                         if state["position"] else None),
-                        "paper_only": True, "minimum_score": MIN_SCORE})
+                        "paper_only": True, "minimum_score": MIN_SCORE,
+                        "rejection_counts": dict(state.get("rejection_counts", {})),
+                        "recent_rejections": list(state.get("recent_rejections", []))})
 
 
 # Start the analysis engine when the module is imported by Gunicorn as well as
@@ -831,7 +923,7 @@ def start_engine_once() -> None:
         if _engine_thread is not None and _engine_thread.is_alive():
             return
         _engine_thread = threading.Thread(
-            target=run_bot, daemon=True, name="kcoms-v7.2-engine"
+            target=run_bot, daemon=True, name="kcoms-v7.4-engine"
         )
         _engine_thread.start()
 

@@ -1,4 +1,4 @@
-"""KCOMS V7.5 - multi-timeframe BTCUSDT signal engine with V6.7-compatible Binance price fallback.
+"""KCOMS V7.6 - multi-timeframe BTCUSDT signal engine with V6.7-compatible Binance price fallback.
 
 Paper-trading by default. Live execution is intentionally not implemented in this
 release; do not enable real orders until a separately tested Binance USD-M Futures
@@ -6,13 +6,15 @@ execution/risk module has been added.
 
 Dependencies: pip install flask requests
 Environment:
-  8834684274:AAE2vGC7TruiUV_YNNuaky5AMqOtoSMm4OU, 498798769 (optional)
+  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID (optional)
   SYMBOL=BTCUSDT
   MIN_SCORE=60
   PAPER_BALANCE=100
   PAPER_BALANCE_FILE=/tmp/kcoms_v7_balance.json
   SCAN_INTERVAL=1
   COOLDOWN_MINUTES=2
+  PRICE_STALE_SECONDS=5
+  PRICE_RELAY_INTERVAL=15
   TRADE_ENABLED=false (true is rejected intentionally in this build)
 """
 
@@ -22,6 +24,7 @@ import math
 import os
 import threading
 import time
+import queue
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -45,7 +48,10 @@ TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 TRADE_ENABLED = os.getenv("TRADE_ENABLED", "false").lower() == "true"
 PAPER_FEE_RATE = float(os.getenv("PAPER_FEE_RATE", "0.001"))  # estimated fee per side
-PRICE_STALE_SECONDS = max(3, int(os.getenv("PRICE_STALE_SECONDS", "10")))
+PRICE_STALE_SECONDS = max(2, int(os.getenv("PRICE_STALE_SECONDS", "5")))
+PRICE_RELAY_INTERVAL = max(5, int(os.getenv("PRICE_RELAY_INTERVAL", "15")))
+REST_CONNECT_TIMEOUT = max(0.5, float(os.getenv("REST_CONNECT_TIMEOUT", "1.5")))
+REST_READ_TIMEOUT = max(1.0, float(os.getenv("REST_READ_TIMEOUT", "2.5")))
 # Signal freshness windows: lower-timeframe confirmation may arrive after structure forms.
 CHOCH_VALID_30S_CANDLES = max(1, int(os.getenv("CHOCH_VALID_30S_CANDLES", "5")))
 STRUCTURE_VALID_5M_CANDLES = max(1, int(os.getenv("STRUCTURE_VALID_5M_CANDLES", "2")))
@@ -83,25 +89,35 @@ def current_clock() -> dict:
             "timezone": "EAT", "timestamp": now.isoformat()}
 
 price_lock = threading.RLock()
-price_feed = {"price": None, "received_at": 0.0, "source": "WAITING_FOR_BINANCE_SPOT"}
+price_feed = {
+    "price": None, "received_at": 0.0, "source": "WAITING_FOR_BINANCE_SPOT",
+    "exchange_event_ms": None, "exchange_trade_ms": None,
+    "latency_ms": None, "ws_connected": False, "last_ws_message_at": 0.0,
+}
+telegram_queue = queue.Queue(maxsize=500)
+telegram_worker_started = False
+telegram_last_relay = 0.0
+rest_endpoint_retry_after = {}
 ws_thread = None
 ws_stop = threading.Event()
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "Mozilla/5.0 (compatible; KCOMS-V7.5/1.0)"})
+SESSION.headers.update({"User-Agent": "Mozilla/5.0 (compatible; KCOMS-V7.6/1.0)"})
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
 )
-log = logging.getLogger("KCOMS-V7.5")
+log = logging.getLogger("KCOMS-V7.6")
 
 # ----------------------------- Runtime state -----------------------------
 lock = threading.RLock()
 latest = {
-    "bot": "KCOMS V7.5", "status": "BOOTING", "symbol": SYMBOL,
+    "bot": "KCOMS V7.6", "status": "BOOTING", "symbol": SYMBOL,
     **current_clock(),
-    "price": 0.0, "ema": 0.0, "price_source": "NOT_CONNECTED", "price_timestamp": None, "price_age_seconds": None, "bias": "NEUTRAL", "signal": "NONE", "score": 0,
+    "price": 0.0, "ema": 0.0, "price_source": "NOT_CONNECTED", "price_timestamp": None,
+    "price_age_seconds": None, "price_latency_ms": None, "price_feed_status": "CONNECTING",
+    "bias": "NEUTRAL", "signal": "NONE", "score": 0,
     "wins": 0, "losses": 0, "completed_trades": 0, "trades_today": 0,
     "balance": PAPER_START_BALANCE, "last_signal": "Starting",
     "market_regime": "UNKNOWN", "entry_status": "WAITING", "rejection_reasons": [],
@@ -127,46 +143,97 @@ state = {
 
 # Cached candles avoid requesting five full histories every second.
 candle_cache: Dict[str, Dict[str, object]] = {}
-CACHE_TTL = {"1m": 8, "5m": 15, "15m": 30, "30m": 45, "1h": 60}
+CACHE_TTL = {"1m": 2, "5m": 15, "15m": 30, "30m": 45, "1h": 60}
 
 # ----------------------------- Notifications -----------------------------
+def _telegram_sender_worker() -> None:
+    """Deliver queued Telegram messages off the market-scanning thread."""
+    while True:
+        message = telegram_queue.get()
+        try:
+            if TG_TOKEN and TG_CHAT:
+                response = SESSION.post(
+                    f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                    json={"chat_id": TG_CHAT, "text": message},
+                    timeout=(2, 4),
+                )
+                response.raise_for_status()
+        except requests.RequestException as exc:
+            log.warning("Telegram delivery failed: %s", exc)
+        finally:
+            telegram_queue.task_done()
+
+
+def start_telegram_worker_once() -> None:
+    global telegram_worker_started
+    if telegram_worker_started:
+        return
+    telegram_worker_started = True
+    threading.Thread(
+        target=_telegram_sender_worker, daemon=True, name="telegram-outbox"
+    ).start()
+
+
 def send_tg(message: str) -> None:
-    """Send Telegram alert; failures are logged rather than silently swallowed."""
+    """Queue Telegram alerts so network delays never block price scanning."""
     if not TG_TOKEN or not TG_CHAT:
         return
+    start_telegram_worker_once()
     try:
-        response = SESSION.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT, "text": message}, timeout=8,
-        )
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        log.warning("Telegram delivery failed: %s", exc)
+        telegram_queue.put_nowait(message)
+    except queue.Full:
+        log.error("Telegram outbox full; dropping oldest pending message")
+        try:
+            telegram_queue.get_nowait()
+            telegram_queue.task_done()
+            telegram_queue.put_nowait(message)
+        except queue.Empty:
+            pass
 
 # ----------------------------- Market data -----------------------------
 def _record_price(value: float, source: str) -> None:
     if not math.isfinite(value) or value <= 0:
         raise ValueError("Invalid Binance Spot price")
+    received = time.time()
     with price_lock:
-        price_feed.update({"price": value, "received_at": time.time(), "source": source})
+        price_feed.update({"price": value, "received_at": received, "source": source})
+        if source != "BINANCE_SPOT_WS":
+            # A REST snapshot has no exchange event timestamp; don't reuse old WS latency.
+            price_feed["exchange_event_ms"] = None
+            price_feed["exchange_trade_ms"] = None
+            price_feed["latency_ms"] = None
+        age_ms = None
+        if price_feed.get("exchange_event_ms") is not None:
+            age_ms = max(0.0, received * 1000.0 - float(price_feed["exchange_event_ms"]))
+        price_feed["latency_ms"] = round(age_ms, 1) if age_ms is not None else None
     latest["price_source"] = source
     latest["price_timestamp"] = datetime.now(timezone.utc).isoformat()
     latest["price_age_seconds"] = 0.0
+    latest["price_latency_ms"] = price_feed.get("latency_ms")
     latest["last_error"] = ""
 
 
 def _spot_get(path: str, params: dict) -> Optional[object]:
     failures = []
+    now = time.time()
     for base in SPOT_REST_ENDPOINTS:
+        if rest_endpoint_retry_after.get(base, 0.0) > now:
+            continue
         try:
-            response = SESSION.get(base + path, params=params, timeout=(3, 6))
+            response = SESSION.get(
+                base + path, params=params,
+                timeout=(REST_CONNECT_TIMEOUT, REST_READ_TIMEOUT),
+            )
             response.raise_for_status()
             payload = response.json()
             if isinstance(payload, dict) and payload.get("code") not in (None, 0):
                 raise ValueError(f"Binance API {payload.get('code')}: {payload.get('msg')}")
+            rest_endpoint_retry_after.pop(base, None)
             return payload
         except (requests.RequestException, ValueError) as exc:
             failures.append(f"{base}: {exc}")
+            # Temporarily skip a failing host rather than paying its timeout on every scan.
+            rest_endpoint_retry_after[base] = time.time() + 30
     latest["last_error"] = " | ".join(failures[-3:]) or "No Binance Spot REST endpoint responded"
     return None
 
@@ -182,19 +249,41 @@ def _websocket_price_worker() -> None:
     while not ws_stop.is_set():
         url = PRICE_WS_URLS[attempt % len(PRICE_WS_URLS)]
         try:
+            def on_open(_ws):
+                with price_lock:
+                    price_feed["ws_connected"] = True
+                latest["price_feed_status"] = "WEBSOCKET_CONNECTED"
+                log.info("Binance Spot WebSocket connected: %s", url)
+
             def on_message(_ws, message):
                 try:
                     payload = json.loads(message)
-                    _record_price(float(payload["p"]), "BINANCE_SPOT_WS")
+                    price = float(payload["p"])
+                    event_ms = payload.get("E")
+                    trade_ms = payload.get("T")
+                    with price_lock:
+                        price_feed["exchange_event_ms"] = int(event_ms) if event_ms else None
+                        price_feed["exchange_trade_ms"] = int(trade_ms) if trade_ms else None
+                        price_feed["last_ws_message_at"] = time.time()
+                    _record_price(price, "BINANCE_SPOT_WS")
                 except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                     log.warning("Ignored malformed Binance Spot WebSocket message")
+
             def on_error(_ws, error):
+                latest["price_feed_status"] = "WEBSOCKET_ERROR"
                 log.warning("Binance Spot WebSocket error: %s", error)
+
             def on_close(_ws, _code, _message):
+                with price_lock:
+                    price_feed["ws_connected"] = False
+                latest["price_feed_status"] = "WEBSOCKET_RECONNECTING"
                 log.warning("Binance Spot WebSocket disconnected")
-            app_ws = websocket.WebSocketApp(url, on_message=on_message,
-                                            on_error=on_error, on_close=on_close)
-            app_ws.run_forever(ping_interval=20, ping_timeout=10)
+
+            app_ws = websocket.WebSocketApp(
+                url, on_open=on_open, on_message=on_message,
+                on_error=on_error, on_close=on_close,
+            )
+            app_ws.run_forever(ping_interval=15, ping_timeout=8)
         except Exception as exc:
             log.warning("Binance Spot WebSocket connection failed: %s", exc)
         attempt += 1
@@ -205,7 +294,7 @@ def start_price_websocket_once() -> None:
     global ws_thread
     if ws_thread is not None and ws_thread.is_alive():
         return
-    ws_thread = threading.Thread(target=_websocket_price_worker, daemon=True, name="binance-spot-ws-v72")
+    ws_thread = threading.Thread(target=_websocket_price_worker, daemon=True, name="binance-spot-ws-v76")
     ws_thread.start()
 
 
@@ -241,6 +330,12 @@ def get_price() -> Optional[float]:
     if cached_price is not None and age <= PRICE_STALE_SECONDS:
         latest["price_source"] = source
         latest["price_age_seconds"] = round(age, 2)
+        with price_lock:
+            latest["price_latency_ms"] = price_feed.get("latency_ms")
+            latest["price_feed_status"] = (
+                "WEBSOCKET_CONNECTED" if price_feed.get("ws_connected")
+                else "REST_OR_CACHED"
+            )
         return float(cached_price)
 
     # First try the direct last-traded-price endpoint.
@@ -264,9 +359,11 @@ def get_price() -> Optional[float]:
             return value
 
     latest["price_source"] = "UNAVAILABLE"
+    latest["price_feed_status"] = "STALE_OR_DISCONNECTED"
     with price_lock:
         latest["price_age_seconds"] = (round(time.time() - float(price_feed["received_at"]), 2)
                                         if price_feed["received_at"] else None)
+        latest["price_latency_ms"] = price_feed.get("latency_ms")
     return None
 
 
@@ -669,7 +766,7 @@ def open_paper_position(signal: dict) -> None:
     state["trades_today"] += 1
     save_state()
     msg = (
-        f"🟢 KCOMS V7.5 PAPER {signal['direction']} {SYMBOL}\nDate: {current_clock()['date']} EAT\n"
+        f"🟢 KCOMS V7.6 PAPER {signal['direction']} {SYMBOL}\nDate: {current_clock()['date']} EAT\n"
         f"Entry: {signal['price']:.2f}\nSL: {signal['stop']:.2f}\n"
         f"TP: {signal['target']:.2f}\nScore: {signal['score']}/100\n"
         f"Risk: ${risk_cash:.2f} | Notional: ${notional:.2f}\n"
@@ -706,7 +803,7 @@ def monitor_paper_position(price: float) -> None:
         state["losses"] += 1
         state["cooldown_until"] = time.time() + COOLDOWN_MINUTES * 60
     msg = (
-        f"{'✅' if pnl > 0 else '❌'} KCOMS V7.5 PAPER {result} {side}\nDate: {current_clock()['date']} EAT\n"
+        f"{'✅' if pnl > 0 else '❌'} KCOMS V7.6 PAPER {result} {side}\nDate: {current_clock()['date']} EAT\n"
         f"Exit: {exit_price:.2f}\nNet P/L: ${pnl:.4f} (estimated fees included)\n"
         f"Paper balance: ${state['balance']:.2f}\n"
         f"W:{state['wins']} L:{state['losses']}"
@@ -719,6 +816,29 @@ def monitor_paper_position(price: float) -> None:
     latest.update({"wins": state["wins"], "losses": state["losses"],
                    "completed_trades": state["wins"] + state["losses"],
                    "balance": round(state["balance"], 2)})
+
+# ----------------------------- Telegram price relay -----------------------------
+def relay_price_to_telegram(price: float) -> None:
+    """Send periodic live-price snapshots without blocking the scan loop."""
+    global telegram_last_relay
+    now = time.time()
+    if not TG_TOKEN or not TG_CHAT or now - telegram_last_relay < PRICE_RELAY_INTERVAL:
+        return
+    telegram_last_relay = now
+    with price_lock:
+        source = price_feed.get("source", "UNKNOWN")
+        age = max(0.0, now - float(price_feed.get("received_at") or now))
+        latency = price_feed.get("latency_ms")
+        connected = bool(price_feed.get("ws_connected"))
+    latency_text = f"{latency:.0f}ms" if isinstance(latency, (int, float)) else "n/a"
+    send_tg(
+        f"📡 {SYMBOL} PRICE UPDATE\n"
+        f"Price: {price:.2f}\n"
+        f"Feed: {source} | Age: {age:.1f}s\n"
+        f"Exchange-to-server latency: {latency_text}\n"
+        f"WebSocket: {'CONNECTED' if connected else 'RECONNECTING / REST FALLBACK'}"
+    )
+
 
 # ----------------------------- Console monitoring -----------------------------
 def log_live_status(price: Optional[float], force: bool = False) -> None:
@@ -775,17 +895,19 @@ def log_live_status(price: Optional[float], force: bool = False) -> None:
 # ----------------------------- Main loop -----------------------------
 def run_bot() -> None:
     load_state()
+    start_telegram_worker_once()
     start_price_websocket_once()
     latest.update({"status": "SCANNING", "balance": round(state["balance"], 2)})
     send_tg(
-        f"🚀 KCOMS V7.5 ONLINE\nDate: {current_clock()['date']} EAT\n{SYMBOL} | LONG + SHORT\n"
+        f"🚀 KCOMS V7.6 ONLINE\nDate: {current_clock()['date']} EAT\n{SYMBOL} | LONG + SHORT\n"
         f"Trend: 30M primary + 1H preference | BOS/Sweep: 5M | CHOCH: 1M\n"
         f"Entry: 1M breakout or retest/reclaim | Range reversals require 5M sweep\n"
         f"CHOCH validity: {CHOCH_VALID_30S_CANDLES} completed 30s candles\n"
         f"Minimum score: {MIN_SCORE}/100 | Adaptive entries | Paper trading only\n"
-        f"Target RR: 1:{RR_TARGET} | Scan: {SCAN_INTERVAL}s"
+        f"Target RR: 1:{RR_TARGET} | Scan: {SCAN_INTERVAL}s\n"
+        f"Live price relay: every {PRICE_RELAY_INTERVAL}s | Stale threshold: {PRICE_STALE_SECONDS}s"
     )
-    log.info("KCOMS V7.5 started: %s; minimum score %s; risk %.3f%%; daily trade limit %s; cooldown %sm; heartbeat every %ss", SYMBOL, MIN_SCORE, RISK_PERCENT, MAX_TRADES_PER_DAY, COOLDOWN_MINUTES, LOG_INTERVAL_SECONDS)
+    log.info("KCOMS V7.6 started: %s; minimum score %s; risk %.3f%%; daily trade limit %s; cooldown %sm; heartbeat every %ss", SYMBOL, MIN_SCORE, RISK_PERCENT, MAX_TRADES_PER_DAY, COOLDOWN_MINUTES, LOG_INTERVAL_SECONDS)
     log_live_status(None, force=True)
 
     while True:
@@ -800,6 +922,7 @@ def run_bot() -> None:
                     log_live_status(None)
                     time.sleep(SCAN_INTERVAL)
                     continue
+                relay_price_to_telegram(price)
                 monitor_paper_position(price)
                 analysis = analyse_market(price)
                 if analysis is None:
@@ -856,7 +979,7 @@ def run_bot() -> None:
                 if analysis["confirmed"] and state["last_alert_key"] != alert_key:
                     state["last_alert_key"] = alert_key
                     send_tg(
-                        f"🔎 KCOMS V7.5 SETUP {analysis['direction']} {SYMBOL}\nDate: {current_clock()['date']} EAT\n"
+                        f"🔎 KCOMS V7.6 SETUP {analysis['direction']} {SYMBOL}\nDate: {current_clock()['date']} EAT\n"
                         f"Score: {analysis['score']}/100\nPrice: {price:.2f}\n"
                         f"Regime: {analysis['regime']}\n"
                         f"Evidence: {', '.join(analysis['reasons'])}"
@@ -891,10 +1014,11 @@ def home():
         latest.update(current_clock())
         data = dict(latest)
     return (
-        "<h1>KCOMS V7.5</h1>"
+        "<h1>KCOMS V7.6</h1>"
         f"<p>Date: {data['date']} | Time: {data['time']} {data['timezone']}</p>"
         f"<p>{data['symbol']} | BINANCE SPOT DATA | PAPER ONLY | Minimum score {MIN_SCORE}/100</p>"
         f"<p>Status: {data['status']} | Price: {data['price']} | Source: {data.get('price_source', 'UNKNOWN')} | Bias: {data['bias']}</p>"
+        f"<p>Feed: {data.get('price_feed_status', 'UNKNOWN')} | Price age: {data.get('price_age_seconds')}s | Exchange latency: {data.get('price_latency_ms')}ms</p>"
         f"<p>Signal: {data['signal']} ({data['score']}/100) | Regime: {data['market_regime']} | Entry: {data.get('entry_status', 'WAITING')} | Trigger: {data.get('entry_trigger', 'NONE')}</p>"
         f"<p>LONG score: {data.get('long_score', 0)} | SHORT score: {data.get('short_score', 0)}</p>"
         f"<p>Rejection reasons: {', '.join(data.get('rejection_reasons', [])) or 'None'}</p>"
@@ -912,7 +1036,7 @@ def home():
 @app.route("/health")
 def health():
     latest.update(current_clock())
-    return jsonify({"ok": True, "bot": "KCOMS V7.5", "status": latest["status"], **current_clock()}), 200
+    return jsonify({"ok": True, "bot": "KCOMS V7.6", "status": latest["status"], **current_clock()}), 200
 
 
 @app.route("/status")
@@ -951,7 +1075,7 @@ def start_engine_once() -> None:
         if _engine_thread is not None and _engine_thread.is_alive():
             return
         _engine_thread = threading.Thread(
-            target=run_bot, daemon=True, name="kcoms-v7.5-engine"
+            target=run_bot, daemon=True, name="kcoms-v7.6-engine"
         )
         _engine_thread.start()
 

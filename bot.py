@@ -1,4 +1,4 @@
-"""KCOMS V7.7 - multi-timeframe BTCUSDT signal engine with V6.7-compatible Binance price fallback.
+"""KCOMS V7.8 - multi-timeframe BTCUSDT signal engine with V6.7-compatible Binance price fallback.
 
 Paper-trading by default. Live execution is intentionally not implemented in this
 release; do not enable real orders until a separately tested Binance USD-M Futures
@@ -41,6 +41,7 @@ COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "2"))
 RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.1"))  # percent of paper equity
 RR_TARGET = float(os.getenv("RR_TARGET", "2.0"))
 MAX_NOTIONAL_USDT = float(os.getenv("MAX_NOTIONAL_USDT", "100"))
+MAX_ENTRY_EXTENSION_ATR = float(os.getenv("MAX_ENTRY_EXTENSION_ATR", "1.5"))  # avoid chasing price too far from 1m EMA20
 PAPER_BALANCE_FILE = os.getenv("PAPER_BALANCE_FILE", "/tmp/kcoms_v7_balance.json")
 PAPER_START_BALANCE = float(os.getenv("PAPER_BALANCE", "100"))
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -99,18 +100,18 @@ ws_thread = None
 ws_stop = threading.Event()
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "Mozilla/5.0 (compatible; KCOMS-V7.7/1.0)"})
+SESSION.headers.update({"User-Agent": "Mozilla/5.0 (compatible; KCOMS-V7.8/1.0)"})
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
 )
-log = logging.getLogger("KCOMS-V7.7")
+log = logging.getLogger("KCOMS-V7.8")
 
 # ----------------------------- Runtime state -----------------------------
 lock = threading.RLock()
 latest = {
-    "bot": "KCOMS V7.7", "status": "BOOTING", "symbol": SYMBOL,
+    "bot": "KCOMS V7.8", "status": "BOOTING", "symbol": SYMBOL,
     **current_clock(),
     "price": 0.0, "ema": 0.0, "price_source": "NOT_CONNECTED", "price_timestamp": None,
     "price_age_seconds": None, "price_latency_ms": None, "price_feed_status": "CONNECTING",
@@ -448,25 +449,17 @@ def trend_bias(candles: List[dict]) -> str:
 def entry_confirmation(direction: str, bias30: str, regime: str,
                        side_sweep: bool, side_bos: bool, side_choch: bool,
                        side_trigger: bool) -> Tuple[bool, List[str]]:
-    """Return hard-gate result and transparent reasons for the selected side."""
-    is_long = direction == "LONG"
-    expected = "BULLISH" if is_long else "BEARISH"
-    opposite = "BEARISH" if is_long else "BULLISH"
+    """V7.8 confluence gate: trend is weighted, structure + LTF trigger are required."""
     rejected = []
-    if bias30 == opposite:
-        rejected.append("30M trend opposes setup")
-    if not side_choch:
-        rejected.append("no fresh 1M CHOCH")
-    if not side_trigger:
-        rejected.append("no current 1M breakout or retest/reclaim trigger")
-    if regime == "TRENDING" and not (side_sweep or side_bos):
+    structure_ok = side_sweep or side_bos
+    lower_tf_ok = side_choch or side_trigger
+    if not structure_ok:
         rejected.append("no recent 5M BOS or liquidity sweep")
-    if regime == "RANGING" and not side_sweep:
-        rejected.append("range entry requires a 5M liquidity sweep")
-    trend_context_ok = bias30 == expected or (bias30 == "NEUTRAL" and regime == "RANGING" and side_sweep)
-    structure_ok = (side_sweep or side_bos) if regime == "TRENDING" else side_sweep
-    confirmed = trend_context_ok and structure_ok and side_choch and side_trigger
-    return confirmed, rejected
+    if not lower_tf_ok:
+        rejected.append("no fresh 1M CHOCH or valid breakout/reclaim trigger")
+    # 30m opposition is deliberately not a hard veto. It is penalized in the
+    # directional score; a strong 5m/1m reversal can still qualify.
+    return structure_ok and lower_tf_ok, rejected
 
 
 def analyse_market(current_price: Optional[float] = None) -> Optional[dict]:
@@ -568,8 +561,23 @@ def analyse_market(current_price: Optional[float] = None) -> Optional[dict]:
         if breakout["c"] < level_down and breakout["c"] < breakout["o"]:
             if last1["h"] >= level_down - retest_tolerance and last1["c"] < level_down and last1["c"] < last1["o"]:
                 trigger_down_retest, retest_down_level = True, level_down
-    trigger_up = trigger_up_breakout or trigger_up_retest
-    trigger_down = trigger_down_breakout or trigger_down_retest
+    # EMA20 pullback/reclaim is an additional entry path. It catches orderly
+    # continuation entries that do not print a textbook micro-range breakout.
+    ema20_1m = ema([x["c"] for x in c1], 20)
+    pullback_tolerance = 0.20 * (atr1 or 0.0)
+    prior1 = c1[-2]
+    trigger_up_pullback = bool(
+        ema20_1m is not None and atr1 and atr1 > 0
+        and prior1["l"] <= ema20_1m + pullback_tolerance
+        and last1["c"] > ema20_1m and last1["c"] > last1["o"]
+    )
+    trigger_down_pullback = bool(
+        ema20_1m is not None and atr1 and atr1 > 0
+        and prior1["h"] >= ema20_1m - pullback_tolerance
+        and last1["c"] < ema20_1m and last1["c"] < last1["o"]
+    )
+    trigger_up = trigger_up_breakout or trigger_up_retest or trigger_up_pullback
+    trigger_down = trigger_down_breakout or trigger_down_retest or trigger_down_pullback
 
     rsi1 = rsi([x["c"] for x in c1], 14)
     avg_vol = sum(x["v"] for x in c1[-21:-1]) / 20
@@ -588,6 +596,7 @@ def analyse_market(current_price: Optional[float] = None) -> Optional[dict]:
             if choch_up: points += 15; reasons.append(f"1M bullish CHOCH active ({choch_up_age}/{CHOCH_VALID_30S_CANDLES} completed 30s candles)")
             if trigger_up_breakout: points += 15; reasons.append("1M bullish breakout trigger")
             elif trigger_up_retest: points += 15; reasons.append("1M bullish retest/reclaim trigger")
+            elif trigger_up_pullback: points += 15; reasons.append("1M bullish EMA20 pullback/reclaim")
             if len(c15) >= 3 and c15[-1]["l"] > c15[-3]["h"]:
                 points += 8; reasons.append("15M bullish FVG")
             if volume_ok and rsi1 is not None and 48 <= rsi1 <= 74:
@@ -603,6 +612,7 @@ def analyse_market(current_price: Optional[float] = None) -> Optional[dict]:
             if choch_down: points += 15; reasons.append(f"1M bearish CHOCH active ({choch_down_age}/{CHOCH_VALID_30S_CANDLES} completed 30s candles)")
             if trigger_down_breakout: points += 15; reasons.append("1M bearish breakout trigger")
             elif trigger_down_retest: points += 15; reasons.append("1M bearish retest/reclaim trigger")
+            elif trigger_down_pullback: points += 15; reasons.append("1M bearish EMA20 pullback/reclaim")
             if len(c15) >= 3 and c15[-1]["h"] < c15[-3]["l"]:
                 points += 8; reasons.append("15M bearish FVG")
             if volume_ok and rsi1 is not None and 26 <= rsi1 <= 52:
@@ -637,20 +647,29 @@ def analyse_market(current_price: Optional[float] = None) -> Optional[dict]:
         risk_ok = bool(atr1 and risk_distance >= 0.8 * atr1 and risk_distance <= 3.5 * atr1)
         if not risk_ok:
             rejected.append("stop distance outside ATR risk limits")
+        extension_atr = None
+        if ema20_1m is not None and atr1 and atr1 > 0:
+            extension_atr = ((price - ema20_1m) / atr1 if is_long_side
+                             else (ema20_1m - price) / atr1)
+        chase_ok = extension_atr is None or extension_atr <= MAX_ENTRY_EXTENSION_ATR
+        if not chase_ok:
+            rejected.append(f"entry overextended ({extension_atr:.2f} ATR from 1M EMA20; max {MAX_ENTRY_EXTENSION_ATR:.2f})")
         if side_score < MIN_SCORE:
             rejected.append(f"score {side_score} below minimum {MIN_SCORE}")
-        confirmed = hard_confirm and risk_ok and side_score >= MIN_SCORE
+        confirmed = hard_confirm and risk_ok and chase_ok and side_score >= MIN_SCORE
         if not confirmed and not rejected:
             rejected.append("setup did not pass all entry gates")
         trigger_name = (
             "BREAKOUT" if (trigger_up_breakout if is_long_side else trigger_down_breakout)
             else "RETEST_RECLAIM" if (trigger_up_retest if is_long_side else trigger_down_retest)
+            else "EMA20_PULLBACK_RECLAIM" if (trigger_up_pullback if is_long_side else trigger_down_pullback)
             else "NONE"
         )
         return {
             "direction": side, "score": side_score, "reasons": side_reasons,
             "rejection_reasons": rejected, "confirmed": confirmed,
             "stop": stop, "target": target, "risk_distance": risk_distance,
+            "entry_extension_atr": extension_atr, "chase_ok": chase_ok,
             "entry_trigger": trigger_name,
         }
 
@@ -678,6 +697,7 @@ def analyse_market(current_price: Optional[float] = None) -> Optional[dict]:
                       "rejection_reasons": short_candidate["rejection_reasons"]},
         },
         "entry_trigger": selected["entry_trigger"],
+        "entry_extension_atr": selected.get("entry_extension_atr"),
         "bias_30m": bias30, "bias_1h": bias1h,
         "bias_15m": bias15, "regime": regime, "atr_1m": atr1,
         "confirmation_windows": {
@@ -763,7 +783,7 @@ def open_paper_position(signal: dict) -> None:
     state["trades_today"] += 1
     save_state()
     msg = (
-        f"🟢 KCOMS V7.5 PAPER {signal['direction']} {SYMBOL}\nDate: {current_clock()['date']} EAT\n"
+        f"🟢 KCOMS V7.8 PAPER {signal['direction']} {SYMBOL}\nDate: {current_clock()['date']} EAT\n"
         f"Entry: {signal['price']:.2f}\nSL: {signal['stop']:.2f}\n"
         f"TP: {signal['target']:.2f}\nScore: {signal['score']}/100\n"
         f"Risk: ${risk_cash:.2f} | Notional: ${notional:.2f}\n"
@@ -800,7 +820,7 @@ def monitor_paper_position(price: float) -> None:
         state["losses"] += 1
         state["cooldown_until"] = time.time() + COOLDOWN_MINUTES * 60
     msg = (
-        f"{'✅' if pnl > 0 else '❌'} KCOMS V7.5 PAPER {result} {side}\nDate: {current_clock()['date']} EAT\n"
+        f"{'✅' if pnl > 0 else '❌'} KCOMS V7.8 PAPER {result} {side}\nDate: {current_clock()['date']} EAT\n"
         f"Exit: {exit_price:.2f}\nNet P/L: ${pnl:.4f} (estimated fees included)\n"
         f"Paper balance: ${state['balance']:.2f}\n"
         f"W:{state['wins']} L:{state['losses']}"
@@ -872,7 +892,7 @@ def run_bot() -> None:
     start_telegram_worker_once()
     start_price_websocket_once()
     latest.update({"status": "SCANNING", "balance": round(state["balance"], 2)})
-    log.info("KCOMS V7.7 started: %s; minimum score %s; risk %.3f%%; daily trade limit %s; cooldown %sm; heartbeat every %ss", SYMBOL, MIN_SCORE, RISK_PERCENT, MAX_TRADES_PER_DAY, COOLDOWN_MINUTES, LOG_INTERVAL_SECONDS)
+    log.info("KCOMS V7.8 started: %s; LONG+SHORT; minimum score %s; risk %.3f%%; RR 1:%.2f; daily trade limit %s; cooldown %sm; max entry extension %.2f ATR; trade-only Telegram alerts", SYMBOL, MIN_SCORE, RISK_PERCENT, RR_TARGET, MAX_TRADES_PER_DAY, COOLDOWN_MINUTES, MAX_ENTRY_EXTENSION_ATR)
     log_live_status(None, force=True)
 
     while True:
@@ -970,7 +990,7 @@ def home():
         latest.update(current_clock())
         data = dict(latest)
     return (
-        "<h1>KCOMS V7.7</h1>"
+        "<h1>KCOMS V7.8</h1>"
         f"<p>Date: {data['date']} | Time: {data['time']} {data['timezone']}</p>"
         f"<p>{data['symbol']} | BINANCE SPOT DATA | PAPER ONLY | Minimum score {MIN_SCORE}/100</p>"
         f"<p>Status: {data['status']} | Price: {data['price']} | Source: {data.get('price_source', 'UNKNOWN')} | Bias: {data['bias']}</p>"
@@ -992,7 +1012,7 @@ def home():
 @app.route("/health")
 def health():
     latest.update(current_clock())
-    return jsonify({"ok": True, "bot": "KCOMS V7.7", "status": latest["status"], **current_clock()}), 200
+    return jsonify({"ok": True, "bot": "KCOMS V7.8", "status": latest["status"], **current_clock()}), 200
 
 
 @app.route("/status")
@@ -1031,7 +1051,7 @@ def start_engine_once() -> None:
         if _engine_thread is not None and _engine_thread.is_alive():
             return
         _engine_thread = threading.Thread(
-            target=run_bot, daemon=True, name="kcoms-v7.7-engine"
+            target=run_bot, daemon=True, name="kcoms-v7.8-engine"
         )
         _engine_thread.start()
 

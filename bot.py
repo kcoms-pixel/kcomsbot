@@ -1,4 +1,4 @@
-"""KCOMS V7.4 - multi-timeframe BTCUSDT signal engine with V6.7-compatible Binance price fallback.
+"""KCOMS V7.5 - multi-timeframe BTCUSDT signal engine with V6.7-compatible Binance price fallback.
 
 Paper-trading by default. Live execution is intentionally not implemented in this
 release; do not enable real orders until a separately tested Binance USD-M Futures
@@ -12,6 +12,7 @@ Environment:
   PAPER_BALANCE=100
   PAPER_BALANCE_FILE=/tmp/kcoms_v7_balance.json
   SCAN_INTERVAL=1
+  COOLDOWN_MINUTES=2
   TRADE_ENABLED=false (true is rejected intentionally in this build)
 """
 
@@ -34,7 +35,7 @@ MIN_SCORE = int(os.getenv("MIN_SCORE", "60"))
 SCAN_INTERVAL = max(1, int(os.getenv("SCAN_INTERVAL", "1")))
 LOG_INTERVAL_SECONDS = max(1, int(os.getenv("LOG_INTERVAL_SECONDS", "2")))
 MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "15"))
-COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "5"))
+COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "2"))
 RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.1"))  # percent of paper equity
 RR_TARGET = float(os.getenv("RR_TARGET", "2.0"))
 MAX_NOTIONAL_USDT = float(os.getenv("MAX_NOTIONAL_USDT", "100"))
@@ -87,30 +88,32 @@ ws_thread = None
 ws_stop = threading.Event()
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "Mozilla/5.0 (compatible; KCOMS-V7.4/1.0)"})
+SESSION.headers.update({"User-Agent": "Mozilla/5.0 (compatible; KCOMS-V7.5/1.0)"})
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
 )
-log = logging.getLogger("KCOMS-V7.4")
+log = logging.getLogger("KCOMS-V7.5")
 
 # ----------------------------- Runtime state -----------------------------
 lock = threading.RLock()
 latest = {
-    "bot": "KCOMS V7.4", "status": "BOOTING", "symbol": SYMBOL,
+    "bot": "KCOMS V7.5", "status": "BOOTING", "symbol": SYMBOL,
     **current_clock(),
     "price": 0.0, "ema": 0.0, "price_source": "NOT_CONNECTED", "price_timestamp": None, "price_age_seconds": None, "bias": "NEUTRAL", "signal": "NONE", "score": 0,
     "wins": 0, "losses": 0, "completed_trades": 0, "trades_today": 0,
     "balance": PAPER_START_BALANCE, "last_signal": "Starting",
-    "market_regime": "UNKNOWN", "entry_status": "WAITING", "rejection_reasons": [], "long_score": 0, "short_score": 0, "entry_trigger": "NONE", "last_error": "",
+    "market_regime": "UNKNOWN", "entry_status": "WAITING", "rejection_reasons": [],
+    "side_diagnostics": {}, "long_score": 0, "short_score": 0,
+    "entry_trigger": "NONE", "last_error": "",
 }
 state = {
     "balance": PAPER_START_BALANCE,
     "wins": 0,
     "losses": 0,
     "trades_today": 0,
-    "day": datetime.now(timezone.utc).date().isoformat(),
+    "day": datetime.now(EAT).date().isoformat(),
     "cooldown_until": 0.0,
     "position": None,
     "last_processed_1m": None,
@@ -373,8 +376,9 @@ def entry_confirmation(direction: str, bias30: str, regime: str,
 
 
 def analyse_market(current_price: Optional[float] = None) -> Optional[dict]:
-    # Binance Spot provides native 1m/5m/15m/30m/1h klines. The 30s
-    # CHOCH freshness window is counted from elapsed completed 30s intervals.
+    # Binance Spot provides native 1m/5m/15m/30m/1h klines. CHOCH is detected
+    # on a completed 1m candle; its validity expires after the configured number
+    # of completed 30-second clock intervals. No separate 30s signal is required.
     data = {tf: get_klines(tf, 250) for tf in ("1m", "5m", "15m", "30m", "1h")}
     if any(v is None for v in data.values()):
         return None
@@ -426,7 +430,7 @@ def analyse_market(current_price: Optional[float] = None) -> Optional[dict]:
             if sweep_low_age is None or age < sweep_low_age:
                 sweep_low, sweep_low_age = True, age
 
-    # 1m CHOCH remains active for five completed 30s intervals after it forms.
+    # 1m CHOCH remains active for the configured number of completed 30s intervals.
     choch_up = choch_down = False
     choch_up_age = choch_down_age = None
     now_ms = int(time.time() * 1000)
@@ -517,49 +521,69 @@ def analyse_market(current_price: Optional[float] = None) -> Optional[dict]:
 
     long_score, long_reasons = score_side("LONG")
     short_score, short_reasons = score_side("SHORT")
-    if long_score >= short_score:
-        direction, score, reasons = "LONG", long_score, long_reasons
-    else:
-        direction, score, reasons = "SHORT", short_score, short_reasons
 
-    is_long = direction == "LONG"
-    aligned_30 = bias30 == ("BULLISH" if is_long else "BEARISH")
-    neutral_30 = bias30 == "NEUTRAL"
-    side_sweep = sweep_low if is_long else sweep_high
-    side_bos = bos_long if is_long else bos_short
-    side_choch = choch_up if is_long else choch_down
-    side_trigger = trigger_up if is_long else trigger_down
-    # In trends, accept either BOS or sweep. In ranges, demand a sweep reversal.
-    # 1H is a scoring preference only; 30M remains the directional gate.
-    hard_confirm, rejection_reasons = entry_confirmation(
-        direction, bias30, regime, side_sweep, side_bos, side_choch, side_trigger
-    )
+    def evaluate_side(side: str, side_score: int, side_reasons: List[str]) -> dict:
+        is_long_side = side == "LONG"
+        side_sweep = sweep_low if is_long_side else sweep_high
+        side_bos = bos_long if is_long_side else bos_short
+        side_choch = choch_up if is_long_side else choch_down
+        side_trigger = trigger_up if is_long_side else trigger_down
+        hard_confirm, rejected = entry_confirmation(
+            side, bias30, regime, side_sweep, side_bos, side_choch, side_trigger
+        )
+        if is_long_side:
+            swing_stop = min(x["l"] for x in c1[-8:]) - (0.25 * (atr1 or 0))
+            stop = min(swing_stop, price - 1.2 * (atr1 or 0))
+            risk_distance = price - stop
+        else:
+            swing_stop = max(x["h"] for x in c1[-8:]) + (0.25 * (atr1 or 0))
+            stop = max(swing_stop, price + 1.2 * (atr1 or 0))
+            risk_distance = stop - price
+        target = price + RR_TARGET * risk_distance if is_long_side else price - RR_TARGET * risk_distance
+        risk_ok = bool(atr1 and risk_distance >= 0.8 * atr1 and risk_distance <= 3.5 * atr1)
+        if not risk_ok:
+            rejected.append("stop distance outside ATR risk limits")
+        if side_score < MIN_SCORE:
+            rejected.append(f"score {side_score} below minimum {MIN_SCORE}")
+        confirmed = hard_confirm and risk_ok and side_score >= MIN_SCORE
+        if not confirmed and not rejected:
+            rejected.append("setup did not pass all entry gates")
+        trigger_name = (
+            "BREAKOUT" if (trigger_up_breakout if is_long_side else trigger_down_breakout)
+            else "RETEST_RECLAIM" if (trigger_up_retest if is_long_side else trigger_down_retest)
+            else "NONE"
+        )
+        return {
+            "direction": side, "score": side_score, "reasons": side_reasons,
+            "rejection_reasons": rejected, "confirmed": confirmed,
+            "stop": stop, "target": target, "risk_distance": risk_distance,
+            "entry_trigger": trigger_name,
+        }
 
-    if is_long:
-        swing_stop = min(x["l"] for x in c1[-8:]) - (0.25 * (atr1 or 0))
-        stop = min(swing_stop, price - 1.2 * (atr1 or 0))
-        risk_distance = price - stop
-    else:
-        swing_stop = max(x["h"] for x in c1[-8:]) + (0.25 * (atr1 or 0))
-        stop = max(swing_stop, price + 1.2 * (atr1 or 0))
-        risk_distance = stop - price
-    target = price + RR_TARGET * risk_distance if is_long else price - RR_TARGET * risk_distance
-    risk_ok = bool(atr1 and risk_distance >= 0.8 * atr1 and risk_distance <= 3.5 * atr1)
-    if not risk_ok:
-        rejection_reasons.append("stop distance outside ATR risk limits")
-    if score < MIN_SCORE:
-        rejection_reasons.append(f"score {score} below minimum {MIN_SCORE}")
-    confirmed = hard_confirm and risk_ok and score >= MIN_SCORE
-    if not confirmed and not rejection_reasons:
-        rejection_reasons.append("setup did not pass all entry gates")
+    long_candidate = evaluate_side("LONG", long_score, long_reasons)
+    short_candidate = evaluate_side("SHORT", short_score, short_reasons)
+    # Prefer a fully qualified setup over a higher-scoring side that failed a hard gate.
+    qualified = [x for x in (long_candidate, short_candidate) if x["confirmed"]]
+    selected = max(qualified or [long_candidate, short_candidate], key=lambda x: x["score"])
+    direction = selected["direction"]
+    score = selected["score"]
+    reasons = selected["reasons"]
+    rejection_reasons = selected["rejection_reasons"]
+    stop, target = selected["stop"], selected["target"]
+    risk_distance = selected["risk_distance"]
+    confirmed = selected["confirmed"]
 
     return {
         "price": price, "direction": direction, "score": score,
         "long_score": long_score, "short_score": short_score,
         "reasons": reasons, "rejection_reasons": rejection_reasons,
-        "entry_trigger": ("BREAKOUT" if (trigger_up_breakout if is_long else trigger_down_breakout)
-                          else "RETEST_RECLAIM" if (trigger_up_retest if is_long else trigger_down_retest)
-                          else "NONE"),
+        "side_diagnostics": {
+            "LONG": {"score": long_candidate["score"], "confirmed": long_candidate["confirmed"],
+                     "rejection_reasons": long_candidate["rejection_reasons"]},
+            "SHORT": {"score": short_candidate["score"], "confirmed": short_candidate["confirmed"],
+                      "rejection_reasons": short_candidate["rejection_reasons"]},
+        },
+        "entry_trigger": selected["entry_trigger"],
         "bias_30m": bias30, "bias_1h": bias1h,
         "bias_15m": bias15, "regime": regime, "atr_1m": atr1,
         "confirmation_windows": {
@@ -618,7 +642,7 @@ def save_state() -> None:
 
 
 def reset_daily_counter() -> None:
-    today = datetime.now(timezone.utc).date().isoformat()
+    today = datetime.now(EAT).date().isoformat()
     if today != state["day"]:
         state["day"] = today
         state["trades_today"] = 0
@@ -645,7 +669,7 @@ def open_paper_position(signal: dict) -> None:
     state["trades_today"] += 1
     save_state()
     msg = (
-        f"🟢 KCOMS V7.4 PAPER {signal['direction']} {SYMBOL}\nDate: {current_clock()['date']} EAT\n"
+        f"🟢 KCOMS V7.5 PAPER {signal['direction']} {SYMBOL}\nDate: {current_clock()['date']} EAT\n"
         f"Entry: {signal['price']:.2f}\nSL: {signal['stop']:.2f}\n"
         f"TP: {signal['target']:.2f}\nScore: {signal['score']}/100\n"
         f"Risk: ${risk_cash:.2f} | Notional: ${notional:.2f}\n"
@@ -682,7 +706,7 @@ def monitor_paper_position(price: float) -> None:
         state["losses"] += 1
         state["cooldown_until"] = time.time() + COOLDOWN_MINUTES * 60
     msg = (
-        f"{'✅' if pnl > 0 else '❌'} KCOMS V7.4 PAPER {result} {side}\nDate: {current_clock()['date']} EAT\n"
+        f"{'✅' if pnl > 0 else '❌'} KCOMS V7.5 PAPER {result} {side}\nDate: {current_clock()['date']} EAT\n"
         f"Exit: {exit_price:.2f}\nNet P/L: ${pnl:.4f} (estimated fees included)\n"
         f"Paper balance: ${state['balance']:.2f}\n"
         f"W:{state['wins']} L:{state['losses']}"
@@ -754,14 +778,14 @@ def run_bot() -> None:
     start_price_websocket_once()
     latest.update({"status": "SCANNING", "balance": round(state["balance"], 2)})
     send_tg(
-        f"🚀 KCOMS V7.4 ONLINE\nDate: {current_clock()['date']} EAT\n{SYMBOL} | LONG + SHORT\n"
+        f"🚀 KCOMS V7.5 ONLINE\nDate: {current_clock()['date']} EAT\n{SYMBOL} | LONG + SHORT\n"
         f"Trend: 30M primary + 1H preference | BOS/Sweep: 5M | CHOCH: 1M\n"
         f"Entry: 1M breakout or retest/reclaim | Range reversals require 5M sweep\n"
         f"CHOCH validity: {CHOCH_VALID_30S_CANDLES} completed 30s candles\n"
         f"Minimum score: {MIN_SCORE}/100 | Adaptive entries | Paper trading only\n"
         f"Target RR: 1:{RR_TARGET} | Scan: {SCAN_INTERVAL}s"
     )
-    log.info("KCOMS V7.4 started: %s; minimum score %s; risk %.3f%%; daily trade limit %s; cooldown %sm; heartbeat every %ss", SYMBOL, MIN_SCORE, RISK_PERCENT, MAX_TRADES_PER_DAY, COOLDOWN_MINUTES, LOG_INTERVAL_SECONDS)
+    log.info("KCOMS V7.5 started: %s; minimum score %s; risk %.3f%%; daily trade limit %s; cooldown %sm; heartbeat every %ss", SYMBOL, MIN_SCORE, RISK_PERCENT, MAX_TRADES_PER_DAY, COOLDOWN_MINUTES, LOG_INTERVAL_SECONDS)
     log_live_status(None, force=True)
 
     while True:
@@ -805,6 +829,7 @@ def run_bot() -> None:
                         "score": analysis["score"],
                         "confirmed": analysis["confirmed"],
                         "reasons": analysis["rejection_reasons"],
+                        "side_diagnostics": analysis.get("side_diagnostics", {}),
                     })
                     state["recent_rejections"] = recent[-20:]
 
@@ -815,6 +840,7 @@ def run_bot() -> None:
                     "market_regime": analysis["regime"],
                     "entry_status": "CONFIRMED" if analysis["confirmed"] else "REJECTED",
                     "rejection_reasons": analysis["rejection_reasons"],
+                    "side_diagnostics": analysis.get("side_diagnostics", {}),
                     "long_score": analysis["long_score"], "short_score": analysis["short_score"],
                     "entry_trigger": analysis["entry_trigger"],
                     "rejection_counts": dict(state.get("rejection_counts", {})),
@@ -830,7 +856,7 @@ def run_bot() -> None:
                 if analysis["confirmed"] and state["last_alert_key"] != alert_key:
                     state["last_alert_key"] = alert_key
                     send_tg(
-                        f"🔎 KCOMS V7.4 SETUP {analysis['direction']} {SYMBOL}\nDate: {current_clock()['date']} EAT\n"
+                        f"🔎 KCOMS V7.5 SETUP {analysis['direction']} {SYMBOL}\nDate: {current_clock()['date']} EAT\n"
                         f"Score: {analysis['score']}/100\nPrice: {price:.2f}\n"
                         f"Regime: {analysis['regime']}\n"
                         f"Evidence: {', '.join(analysis['reasons'])}"
@@ -865,13 +891,14 @@ def home():
         latest.update(current_clock())
         data = dict(latest)
     return (
-        "<h1>KCOMS V7.4</h1>"
+        "<h1>KCOMS V7.5</h1>"
         f"<p>Date: {data['date']} | Time: {data['time']} {data['timezone']}</p>"
         f"<p>{data['symbol']} | BINANCE SPOT DATA | PAPER ONLY | Minimum score {MIN_SCORE}/100</p>"
         f"<p>Status: {data['status']} | Price: {data['price']} | Source: {data.get('price_source', 'UNKNOWN')} | Bias: {data['bias']}</p>"
         f"<p>Signal: {data['signal']} ({data['score']}/100) | Regime: {data['market_regime']} | Entry: {data.get('entry_status', 'WAITING')} | Trigger: {data.get('entry_trigger', 'NONE')}</p>"
         f"<p>LONG score: {data.get('long_score', 0)} | SHORT score: {data.get('short_score', 0)}</p>"
         f"<p>Rejection reasons: {', '.join(data.get('rejection_reasons', [])) or 'None'}</p>"
+        f"<p>Side diagnostics: {data.get('side_diagnostics', {})}</p>"
         f"<p>Rejection counts: {data.get('rejection_counts', {})}</p>"
         f"<p>Paper balance: ${data['balance']} | Completed: {data.get('completed_trades', data['wins'] + data['losses'])} "
         f"| Wins: {data['wins']} | Losses: {data['losses']} "
@@ -885,7 +912,7 @@ def home():
 @app.route("/health")
 def health():
     latest.update(current_clock())
-    return jsonify({"ok": True, "bot": "KCOMS V7.4", "status": latest["status"], **current_clock()}), 200
+    return jsonify({"ok": True, "bot": "KCOMS V7.5", "status": latest["status"], **current_clock()}), 200
 
 
 @app.route("/status")
@@ -907,7 +934,8 @@ def status():
                                         if state["position"] else None),
                         "paper_only": True, "minimum_score": MIN_SCORE,
                         "rejection_counts": dict(state.get("rejection_counts", {})),
-                        "recent_rejections": list(state.get("recent_rejections", []))})
+                        "recent_rejections": list(state.get("recent_rejections", [])),
+                        "side_diagnostics": latest.get("side_diagnostics", {})})
 
 
 # Start the analysis engine when the module is imported by Gunicorn as well as
@@ -923,7 +951,7 @@ def start_engine_once() -> None:
         if _engine_thread is not None and _engine_thread.is_alive():
             return
         _engine_thread = threading.Thread(
-            target=run_bot, daemon=True, name="kcoms-v7.4-engine"
+            target=run_bot, daemon=True, name="kcoms-v7.5-engine"
         )
         _engine_thread.start()
 

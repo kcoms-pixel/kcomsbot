@@ -1,10 +1,10 @@
-"""KCOMS V7.6 - multi-timeframe BTCUSDT signal engine with V6.7-compatible Binance price fallback.
+"""KCOMS V7.7 - multi-timeframe BTCUSDT signal engine with V6.7-compatible Binance price fallback.
 
 Paper-trading by default. Live execution is intentionally not implemented in this
 release; do not enable real orders until a separately tested Binance USD-M Futures
 execution/risk module has been added.
 
-Dependencies: pip install flask requests
+Dependencies: pip install -r requirements.txt
 Environment:
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID (optional)
   SYMBOL=BTCUSDT
@@ -14,7 +14,6 @@ Environment:
   SCAN_INTERVAL=1
   COOLDOWN_MINUTES=2
   PRICE_STALE_SECONDS=5
-  PRICE_RELAY_INTERVAL=15
   TRADE_ENABLED=false (true is rejected intentionally in this build)
 """
 
@@ -49,7 +48,6 @@ TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 TRADE_ENABLED = os.getenv("TRADE_ENABLED", "false").lower() == "true"
 PAPER_FEE_RATE = float(os.getenv("PAPER_FEE_RATE", "0.001"))  # estimated fee per side
 PRICE_STALE_SECONDS = max(2, int(os.getenv("PRICE_STALE_SECONDS", "5")))
-PRICE_RELAY_INTERVAL = max(5, int(os.getenv("PRICE_RELAY_INTERVAL", "15")))
 REST_CONNECT_TIMEOUT = max(0.5, float(os.getenv("REST_CONNECT_TIMEOUT", "1.5")))
 REST_READ_TIMEOUT = max(1.0, float(os.getenv("REST_READ_TIMEOUT", "2.5")))
 # Signal freshness windows: lower-timeframe confirmation may arrive after structure forms.
@@ -96,24 +94,23 @@ price_feed = {
 }
 telegram_queue = queue.Queue(maxsize=500)
 telegram_worker_started = False
-telegram_last_relay = 0.0
 rest_endpoint_retry_after = {}
 ws_thread = None
 ws_stop = threading.Event()
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "Mozilla/5.0 (compatible; KCOMS-V7.6/1.0)"})
+SESSION.headers.update({"User-Agent": "Mozilla/5.0 (compatible; KCOMS-V7.7/1.0)"})
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
 )
-log = logging.getLogger("KCOMS-V7.6")
+log = logging.getLogger("KCOMS-V7.7")
 
 # ----------------------------- Runtime state -----------------------------
 lock = threading.RLock()
 latest = {
-    "bot": "KCOMS V7.6", "status": "BOOTING", "symbol": SYMBOL,
+    "bot": "KCOMS V7.7", "status": "BOOTING", "symbol": SYMBOL,
     **current_clock(),
     "price": 0.0, "ema": 0.0, "price_source": "NOT_CONNECTED", "price_timestamp": None,
     "price_age_seconds": None, "price_latency_ms": None, "price_feed_status": "CONNECTING",
@@ -766,7 +763,7 @@ def open_paper_position(signal: dict) -> None:
     state["trades_today"] += 1
     save_state()
     msg = (
-        f"🟢 KCOMS V7.6 PAPER {signal['direction']} {SYMBOL}\nDate: {current_clock()['date']} EAT\n"
+        f"🟢 KCOMS V7.5 PAPER {signal['direction']} {SYMBOL}\nDate: {current_clock()['date']} EAT\n"
         f"Entry: {signal['price']:.2f}\nSL: {signal['stop']:.2f}\n"
         f"TP: {signal['target']:.2f}\nScore: {signal['score']}/100\n"
         f"Risk: ${risk_cash:.2f} | Notional: ${notional:.2f}\n"
@@ -803,7 +800,7 @@ def monitor_paper_position(price: float) -> None:
         state["losses"] += 1
         state["cooldown_until"] = time.time() + COOLDOWN_MINUTES * 60
     msg = (
-        f"{'✅' if pnl > 0 else '❌'} KCOMS V7.6 PAPER {result} {side}\nDate: {current_clock()['date']} EAT\n"
+        f"{'✅' if pnl > 0 else '❌'} KCOMS V7.5 PAPER {result} {side}\nDate: {current_clock()['date']} EAT\n"
         f"Exit: {exit_price:.2f}\nNet P/L: ${pnl:.4f} (estimated fees included)\n"
         f"Paper balance: ${state['balance']:.2f}\n"
         f"W:{state['wins']} L:{state['losses']}"
@@ -816,29 +813,6 @@ def monitor_paper_position(price: float) -> None:
     latest.update({"wins": state["wins"], "losses": state["losses"],
                    "completed_trades": state["wins"] + state["losses"],
                    "balance": round(state["balance"], 2)})
-
-# ----------------------------- Telegram price relay -----------------------------
-def relay_price_to_telegram(price: float) -> None:
-    """Send periodic live-price snapshots without blocking the scan loop."""
-    global telegram_last_relay
-    now = time.time()
-    if not TG_TOKEN or not TG_CHAT or now - telegram_last_relay < PRICE_RELAY_INTERVAL:
-        return
-    telegram_last_relay = now
-    with price_lock:
-        source = price_feed.get("source", "UNKNOWN")
-        age = max(0.0, now - float(price_feed.get("received_at") or now))
-        latency = price_feed.get("latency_ms")
-        connected = bool(price_feed.get("ws_connected"))
-    latency_text = f"{latency:.0f}ms" if isinstance(latency, (int, float)) else "n/a"
-    send_tg(
-        f"📡 {SYMBOL} PRICE UPDATE\n"
-        f"Price: {price:.2f}\n"
-        f"Feed: {source} | Age: {age:.1f}s\n"
-        f"Exchange-to-server latency: {latency_text}\n"
-        f"WebSocket: {'CONNECTED' if connected else 'RECONNECTING / REST FALLBACK'}"
-    )
-
 
 # ----------------------------- Console monitoring -----------------------------
 def log_live_status(price: Optional[float], force: bool = False) -> None:
@@ -898,16 +872,7 @@ def run_bot() -> None:
     start_telegram_worker_once()
     start_price_websocket_once()
     latest.update({"status": "SCANNING", "balance": round(state["balance"], 2)})
-    send_tg(
-        f"🚀 KCOMS V7.6 ONLINE\nDate: {current_clock()['date']} EAT\n{SYMBOL} | LONG + SHORT\n"
-        f"Trend: 30M primary + 1H preference | BOS/Sweep: 5M | CHOCH: 1M\n"
-        f"Entry: 1M breakout or retest/reclaim | Range reversals require 5M sweep\n"
-        f"CHOCH validity: {CHOCH_VALID_30S_CANDLES} completed 30s candles\n"
-        f"Minimum score: {MIN_SCORE}/100 | Adaptive entries | Paper trading only\n"
-        f"Target RR: 1:{RR_TARGET} | Scan: {SCAN_INTERVAL}s\n"
-        f"Live price relay: every {PRICE_RELAY_INTERVAL}s | Stale threshold: {PRICE_STALE_SECONDS}s"
-    )
-    log.info("KCOMS V7.6 started: %s; minimum score %s; risk %.3f%%; daily trade limit %s; cooldown %sm; heartbeat every %ss", SYMBOL, MIN_SCORE, RISK_PERCENT, MAX_TRADES_PER_DAY, COOLDOWN_MINUTES, LOG_INTERVAL_SECONDS)
+    log.info("KCOMS V7.7 started: %s; minimum score %s; risk %.3f%%; daily trade limit %s; cooldown %sm; heartbeat every %ss", SYMBOL, MIN_SCORE, RISK_PERCENT, MAX_TRADES_PER_DAY, COOLDOWN_MINUTES, LOG_INTERVAL_SECONDS)
     log_live_status(None, force=True)
 
     while True:
@@ -922,7 +887,6 @@ def run_bot() -> None:
                     log_live_status(None)
                     time.sleep(SCAN_INTERVAL)
                     continue
-                relay_price_to_telegram(price)
                 monitor_paper_position(price)
                 analysis = analyse_market(price)
                 if analysis is None:
@@ -976,14 +940,6 @@ def run_bot() -> None:
 
                 # Alert only once per completed 1m candle to avoid Telegram spam.
                 alert_key = (analysis["candle_key"], analysis["direction"], analysis["score"])
-                if analysis["confirmed"] and state["last_alert_key"] != alert_key:
-                    state["last_alert_key"] = alert_key
-                    send_tg(
-                        f"🔎 KCOMS V7.6 SETUP {analysis['direction']} {SYMBOL}\nDate: {current_clock()['date']} EAT\n"
-                        f"Score: {analysis['score']}/100\nPrice: {price:.2f}\n"
-                        f"Regime: {analysis['regime']}\n"
-                        f"Evidence: {', '.join(analysis['reasons'])}"
-                    )
 
                 can_open = (
                     analysis["confirmed"] and state["position"] is None
@@ -1014,7 +970,7 @@ def home():
         latest.update(current_clock())
         data = dict(latest)
     return (
-        "<h1>KCOMS V7.6</h1>"
+        "<h1>KCOMS V7.7</h1>"
         f"<p>Date: {data['date']} | Time: {data['time']} {data['timezone']}</p>"
         f"<p>{data['symbol']} | BINANCE SPOT DATA | PAPER ONLY | Minimum score {MIN_SCORE}/100</p>"
         f"<p>Status: {data['status']} | Price: {data['price']} | Source: {data.get('price_source', 'UNKNOWN')} | Bias: {data['bias']}</p>"
@@ -1036,7 +992,7 @@ def home():
 @app.route("/health")
 def health():
     latest.update(current_clock())
-    return jsonify({"ok": True, "bot": "KCOMS V7.6", "status": latest["status"], **current_clock()}), 200
+    return jsonify({"ok": True, "bot": "KCOMS V7.7", "status": latest["status"], **current_clock()}), 200
 
 
 @app.route("/status")
@@ -1075,7 +1031,7 @@ def start_engine_once() -> None:
         if _engine_thread is not None and _engine_thread.is_alive():
             return
         _engine_thread = threading.Thread(
-            target=run_bot, daemon=True, name="kcoms-v7.6-engine"
+            target=run_bot, daemon=True, name="kcoms-v7.7-engine"
         )
         _engine_thread.start()
 

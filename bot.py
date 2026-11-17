@@ -1,4 +1,4 @@
-"""KCOMS V8.0 - quality-filtered multi-timeframe BTCUSDT signal engine with V6.7-compatible Binance price fallback.
+"""KCOMS V8.1 - quality-filtered multi-timeframe BTCUSDT signal engine with V6.7-compatible Binance price fallback.
 
 Paper-trading by default. Live execution is intentionally not implemented in this
 release; do not enable real orders until a separately tested Binance USD-M Futures
@@ -6,7 +6,7 @@ execution/risk module has been added.
 
 Dependencies: pip install -r requirements.txt
 Environment:
-  8809310387:AAGY79kOhNPUULKpcxRuRscG6MgZ7icZuJ8, 498798769 (optional)
+  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID (optional)
   SYMBOL=BTCUSDT
   MIN_SCORE=60
   TRADE_SIZE_USDT=5 (legacy alias for MAX_NOTIONAL_USDT)
@@ -120,18 +120,18 @@ ws_thread = None
 ws_stop = threading.Event()
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "Mozilla/5.0 (compatible; KCOMS-V8.0/1.0)"})
+SESSION.headers.update({"User-Agent": "Mozilla/5.0 (compatible; KCOMS-V8.1/1.0)"})
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
 )
-log = logging.getLogger("KCOMS-V8.0")
+log = logging.getLogger("KCOMS-V8.1")
 
 # ----------------------------- Runtime state -----------------------------
 lock = threading.RLock()
 latest = {
-    "bot": "KCOMS V8.0", "status": "BOOTING", "symbol": SYMBOL,
+    "bot": "KCOMS V8.1", "status": "BOOTING", "symbol": SYMBOL,
     **current_clock(),
     "price": 0.0, "ema": 0.0, "price_source": "NOT_CONNECTED", "price_timestamp": None,
     "price_age_seconds": None, "price_latency_ms": None, "price_feed_status": "CONNECTING",
@@ -221,7 +221,7 @@ def _chart_image(candles: List[dict], proposal: dict) -> io.BytesIO:
         font_small = ImageFont.truetype("DejaVuSans.ttf", 17)
     except OSError:
         font_title = font = font_small = ImageFont.load_default()
-    d.text((35, 24), f"KCOMS V8.0  |  {SYMBOL}  |  {proposal['direction']} SETUP", fill="#FFFFFF", font=font_title)
+    d.text((35, 24), f"KCOMS V8.1  |  {SYMBOL}  |  {proposal['direction']} SETUP", fill="#FFFFFF", font=font_title)
     d.text((38, 76), f"Score {proposal['score']}/100   •   {current_clock()['date']} {current_clock()['time']} EAT", fill="#B8C7D1", font=font)
     plot = (80, 145, 1120, 610)
     left, top, right, bottom = plot
@@ -286,7 +286,7 @@ def send_trade_proposal(proposal: dict) -> None:
         {"text": "❌ REJECT", "callback_data": f"kcoms:reject:{proposal_id}"}
     ]]}
     caption = (
-        f"⚠️ KCOMS V8.0 — TRADE PROPOSAL\n{SYMBOL} {proposal['direction']}\n"
+        f"⚠️ KCOMS V8.1 — TRADE PROPOSAL\n{SYMBOL} {proposal['direction']}\n"
         f"Entry: {proposal['price']:.2f}\nSL: {proposal['stop']:.2f}\nTP: {proposal['target']:.2f}\n"
         f"Score: {proposal['score']}/100 | Net RR after fees: {proposal.get('net_rr_after_fees',0):.2f}\n"
         f"Trigger: {proposal.get('entry_trigger','N/A')}\n"
@@ -304,15 +304,27 @@ def send_trade_proposal(proposal: dict) -> None:
 
 
 def _telegram_callback_worker() -> None:
-    """Long-poll Telegram button callbacks; only the configured chat can decide."""
+    """Single long-poll loop with retry/backoff; only the configured chat can decide."""
     offset = None
+    failures = 0
+    # Polling and webhooks are mutually exclusive in Telegram. Clear a stale webhook
+    # before polling; do not drop queued updates.
+    try:
+        _telegram_api("deleteWebhook", data={"drop_pending_updates": "false"})
+        log.info("Telegram webhook cleared; approval polling mode enabled")
+    except Exception as exc:
+        log.warning("Could not clear Telegram webhook before polling: %s", exc)
     while True:
         try:
             params = {"timeout": 25, "allowed_updates": json.dumps(["callback_query"])}
             if offset is not None: params["offset"] = offset
-            response = SESSION.get(f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates", params=params, timeout=(5, 35))
+            response = SESSION.get(
+                f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates",
+                params=params, timeout=(8, 40)
+            )
             response.raise_for_status()
             payload=response.json()
+            failures = 0
             for update in payload.get("result", []):
                 offset = int(update["update_id"])+1
                 cb=update.get("callback_query") or {}
@@ -351,16 +363,44 @@ def _telegram_callback_worker() -> None:
                 if parts[1]=="reject":
                     with lock:
                         state["pending_approval"]=None
+        except requests.HTTPError as exc:
+            failures += 1
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            delay = min(60, 3 * (2 ** min(failures - 1, 4)))
+            if status == 409:
+                log.error(
+                    "Telegram getUpdates conflict (409). Check that this bot token "
+                    "is not polling from another process and that no webhook is active. "
+                    "Retrying in %ss.", delay, delay
+                )
+            else:
+                log.warning("Telegram approval polling HTTP error (%s): %s; retrying in %ss",
+                            status, exc, delay)
+            time.sleep(delay)
+        except (requests.RequestException, ValueError, RuntimeError) as exc:
+            failures += 1
+            delay = min(60, 2 * (2 ** min(failures - 1, 5)))
+            log.warning("Telegram approval polling error: %s; retrying in %ss", exc, delay)
+            time.sleep(delay)
         except Exception as exc:
-            log.warning("Telegram approval polling error: %s", exc)
-            time.sleep(3)
+            failures += 1
+            delay = min(60, 2 * (2 ** min(failures - 1, 5)))
+            log.exception("Unexpected Telegram approval polling error; retrying in %ss", delay)
+            time.sleep(delay)
 
+
+_approval_start_lock = threading.Lock()
 
 def start_telegram_approval_worker_once() -> None:
-    if not TG_TOKEN or not TG_CHAT or getattr(start_telegram_approval_worker_once, "started", False):
+    if not TG_TOKEN or not TG_CHAT:
         return
-    start_telegram_approval_worker_once.started = True
-    threading.Thread(target=_telegram_callback_worker, daemon=True, name="telegram-approvals").start()
+    with _approval_start_lock:
+        if getattr(start_telegram_approval_worker_once, "started", False):
+            return
+        start_telegram_approval_worker_once.started = True
+        threading.Thread(
+            target=_telegram_callback_worker, daemon=True, name="telegram-approvals"
+        ).start()
 
 # ----------------------------- Market data -----------------------------
 def _record_price(value: float, source: str) -> None:
@@ -1004,7 +1044,7 @@ def open_paper_position(signal: dict) -> None:
     state["trades_today"] += 1
     save_state()
     msg = (
-        f"🟢 KCOMS V8.0 PAPER {signal['direction']} {SYMBOL}\nDate: {current_clock()['date']} EAT\n"
+        f"🟢 KCOMS V8.1 PAPER {signal['direction']} {SYMBOL}\nDate: {current_clock()['date']} EAT\n"
         f"Entry: {signal['price']:.2f}\nSL: {signal['stop']:.2f}\n"
         f"TP: {signal['target']:.2f}\nScore: {signal['score']}/100\n"
         f"Risk: ${risk_cash:.2f} | Notional: ${notional:.2f}\n"
@@ -1057,7 +1097,7 @@ def monitor_paper_position(price: float) -> None:
     })
     state["trade_history"] = state["trade_history"][-100:]
     msg = (
-        f"{'✅' if pnl > 0 else '❌'} KCOMS V8.0 PAPER {result} {side}\nDate: {current_clock()['date']} EAT\n"
+        f"{'✅' if pnl > 0 else '❌'} KCOMS V8.1 PAPER {result} {side}\nDate: {current_clock()['date']} EAT\n"
         f"Exit: {exit_price:.2f}\nNet P/L: ${pnl:.4f} (estimated fees included)\n"
         f"Paper balance: ${state['balance']:.2f}\n"
         f"W:{state['wins']} L:{state['losses']}"
@@ -1130,7 +1170,7 @@ def run_bot() -> None:
     start_telegram_approval_worker_once()
     start_price_websocket_once()
     latest.update({"status": "SCANNING", "balance": round(state["balance"], 2)})
-    log.info("KCOMS V8.0 started: %s; LONG+SHORT; minimum score %s; risk %.3f%%; gross RR 1:%.2f; max notional $%.2f; fee/side %.3f%%; minimum net RR %.2f; daily trade limit %s; cooldown %sm; max entry extension %.2f ATR; Telegram manual approval required; approval timeout %ss",
+    log.info("KCOMS V8.1 started: %s; LONG+SHORT; minimum score %s; risk %.3f%%; gross RR 1:%.2f; max notional $%.2f; fee/side %.3f%%; minimum net RR %.2f; daily trade limit %s; cooldown %sm; max entry extension %.2f ATR; Telegram manual approval required; approval timeout %ss",
              SYMBOL, MIN_SCORE, RISK_PERCENT, RR_TARGET, MAX_NOTIONAL_USDT,
              PAPER_FEE_RATE * 100, MIN_NET_RR_AFTER_FEES,
              MAX_TRADES_PER_DAY, COOLDOWN_MINUTES, MAX_ENTRY_EXTENSION_ATR, APPROVAL_TIMEOUT_SECONDS)
@@ -1265,7 +1305,7 @@ def home():
         latest.update(current_clock())
         data = dict(latest)
     return (
-        "<h1>KCOMS V8.0</h1>"
+        "<h1>KCOMS V8.1</h1>"
         f"<p>Date: {data['date']} | Time: {data['time']} {data['timezone']}</p>"
         f"<p>{data['symbol']} | BINANCE SPOT DATA | PAPER ONLY | Minimum score {MIN_SCORE}/100</p>"
         f"<p>Status: {data['status']} | Price: {data['price']} | Source: {data.get('price_source', 'UNKNOWN')} | Bias: {data['bias']}</p>"
@@ -1287,7 +1327,7 @@ def home():
 @app.route("/health")
 def health():
     latest.update(current_clock())
-    return jsonify({"ok": True, "bot": "KCOMS V8.0", "status": latest["status"], **current_clock()}), 200
+    return jsonify({"ok": True, "bot": "KCOMS V8.1", "status": latest["status"], **current_clock()}), 200
 
 
 @app.route("/status")
@@ -1318,29 +1358,24 @@ def status():
                         "side_diagnostics": latest.get("side_diagnostics", {})})
 
 
-# Start the analysis engine when the module is imported by Gunicorn as well as
-# when run directly. Render's Procfile uses exactly one Gunicorn worker so this
-# process-local guard prevents duplicate engine threads in the supported setup.
-_engine_thread = None
-_engine_start_lock = threading.Lock()
+# ----------------------------- Render service roles -----------------------------
+# Deploy two Render services from this same repository:
+#   Web Service: KCOMS_ROLE=web, Start: gunicorn bot:app --workers 1 --threads 4
+#   Background Worker: KCOMS_ROLE=worker, Start: python bot.py
+# The web process never starts trading threads. Only the background worker runs
+# the scanner, Binance websocket and Telegram polling loop.
+KCOMS_ROLE = os.getenv("KCOMS_ROLE", "web").strip().lower()
 
+if KCOMS_ROLE == "worker":
+    if __name__ == "__main__":
+        log.info("Starting KCOMS V8.1 background trading worker")
+        run_bot()
+elif KCOMS_ROLE == "web":
+    # Intentionally no trading-engine autostart in the Gunicorn web process.
+    pass
+else:
+    raise RuntimeError("KCOMS_ROLE must be either 'web' or 'worker'")
 
-def start_engine_once() -> None:
-    global _engine_thread
-    with _engine_start_lock:
-        if _engine_thread is not None and _engine_thread.is_alive():
-            return
-        _engine_thread = threading.Thread(
-            target=run_bot, daemon=True, name="kcoms-v7.9-engine"
-        )
-        _engine_thread.start()
-
-
-# Gunicorn imports this module; starting here ensures the paper engine runs.
-if os.getenv("KCOMS_DISABLE_ENGINE", "false").lower() != "true":
-    start_engine_once()
-
-
-if __name__ == "__main__":
+if __name__ == "__main__" and KCOMS_ROLE == "web":
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port, threaded=True)

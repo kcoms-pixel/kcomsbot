@@ -1,4 +1,4 @@
-"""KCOMS V8.1 - quality-filtered multi-timeframe BTCUSDT signal engine with V6.7-compatible Binance price fallback.
+"""KCOMS V8.2 - quality-filtered multi-timeframe BTCUSDT signal engine with V6.7-compatible Binance price fallback.
 
 Paper-trading by default. Live execution is intentionally not implemented in this
 release; do not enable real orders until a separately tested Binance USD-M Futures
@@ -120,18 +120,18 @@ ws_thread = None
 ws_stop = threading.Event()
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "Mozilla/5.0 (compatible; KCOMS-V8.1/1.0)"})
+SESSION.headers.update({"User-Agent": "Mozilla/5.0 (compatible; KCOMS-V8.2/1.0)"})
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
 )
-log = logging.getLogger("KCOMS-V8.1")
+log = logging.getLogger("KCOMS-V8.2")
 
 # ----------------------------- Runtime state -----------------------------
 lock = threading.RLock()
 latest = {
-    "bot": "KCOMS V8.1", "status": "BOOTING", "symbol": SYMBOL,
+    "bot": "KCOMS V8.2", "status": "BOOTING", "symbol": SYMBOL,
     **current_clock(),
     "price": 0.0, "ema": 0.0, "price_source": "NOT_CONNECTED", "price_timestamp": None,
     "price_age_seconds": None, "price_latency_ms": None, "price_feed_status": "CONNECTING",
@@ -221,7 +221,7 @@ def _chart_image(candles: List[dict], proposal: dict) -> io.BytesIO:
         font_small = ImageFont.truetype("DejaVuSans.ttf", 17)
     except OSError:
         font_title = font = font_small = ImageFont.load_default()
-    d.text((35, 24), f"KCOMS V8.1  |  {SYMBOL}  |  {proposal['direction']} SETUP", fill="#FFFFFF", font=font_title)
+    d.text((35, 24), f"KCOMS V8.2  |  {SYMBOL}  |  {proposal['direction']} SETUP", fill="#FFFFFF", font=font_title)
     d.text((38, 76), f"Score {proposal['score']}/100   •   {current_clock()['date']} {current_clock()['time']} EAT", fill="#B8C7D1", font=font)
     plot = (80, 145, 1120, 610)
     left, top, right, bottom = plot
@@ -286,7 +286,7 @@ def send_trade_proposal(proposal: dict) -> None:
         {"text": "❌ REJECT", "callback_data": f"kcoms:reject:{proposal_id}"}
     ]]}
     caption = (
-        f"⚠️ KCOMS V8.1 — TRADE PROPOSAL\n{SYMBOL} {proposal['direction']}\n"
+        f"⚠️ KCOMS V8.2 — TRADE PROPOSAL\n{SYMBOL} {proposal['direction']}\n"
         f"Entry: {proposal['price']:.2f}\nSL: {proposal['stop']:.2f}\nTP: {proposal['target']:.2f}\n"
         f"Score: {proposal['score']}/100 | Net RR after fees: {proposal.get('net_rr_after_fees',0):.2f}\n"
         f"Trigger: {proposal.get('entry_trigger','N/A')}\n"
@@ -1044,7 +1044,7 @@ def open_paper_position(signal: dict) -> None:
     state["trades_today"] += 1
     save_state()
     msg = (
-        f"🟢 KCOMS V8.1 PAPER {signal['direction']} {SYMBOL}\nDate: {current_clock()['date']} EAT\n"
+        f"🟢 KCOMS V8.2 PAPER {signal['direction']} {SYMBOL}\nDate: {current_clock()['date']} EAT\n"
         f"Entry: {signal['price']:.2f}\nSL: {signal['stop']:.2f}\n"
         f"TP: {signal['target']:.2f}\nScore: {signal['score']}/100\n"
         f"Risk: ${risk_cash:.2f} | Notional: ${notional:.2f}\n"
@@ -1097,7 +1097,7 @@ def monitor_paper_position(price: float) -> None:
     })
     state["trade_history"] = state["trade_history"][-100:]
     msg = (
-        f"{'✅' if pnl > 0 else '❌'} KCOMS V8.1 PAPER {result} {side}\nDate: {current_clock()['date']} EAT\n"
+        f"{'✅' if pnl > 0 else '❌'} KCOMS V8.2 PAPER {result} {side}\nDate: {current_clock()['date']} EAT\n"
         f"Exit: {exit_price:.2f}\nNet P/L: ${pnl:.4f} (estimated fees included)\n"
         f"Paper balance: ${state['balance']:.2f}\n"
         f"W:{state['wins']} L:{state['losses']}"
@@ -1170,7 +1170,7 @@ def run_bot() -> None:
     start_telegram_approval_worker_once()
     start_price_websocket_once()
     latest.update({"status": "SCANNING", "balance": round(state["balance"], 2)})
-    log.info("KCOMS V8.1 started: %s; LONG+SHORT; minimum score %s; risk %.3f%%; gross RR 1:%.2f; max notional $%.2f; fee/side %.3f%%; minimum net RR %.2f; daily trade limit %s; cooldown %sm; max entry extension %.2f ATR; Telegram manual approval required; approval timeout %ss",
+    log.info("KCOMS V8.2 started: %s; LONG+SHORT; minimum score %s; risk %.3f%%; gross RR 1:%.2f; max notional $%.2f; fee/side %.3f%%; minimum net RR %.2f; daily trade limit %s; cooldown %sm; max entry extension %.2f ATR; Telegram manual approval required; approval timeout %ss",
              SYMBOL, MIN_SCORE, RISK_PERCENT, RR_TARGET, MAX_NOTIONAL_USDT,
              PAPER_FEE_RATE * 100, MIN_NET_RR_AFTER_FEES,
              MAX_TRADES_PER_DAY, COOLDOWN_MINUTES, MAX_ENTRY_EXTENSION_ATR, APPROVAL_TIMEOUT_SECONDS)
@@ -1305,7 +1305,7 @@ def home():
         latest.update(current_clock())
         data = dict(latest)
     return (
-        "<h1>KCOMS V8.1</h1>"
+        "<h1>KCOMS V8.2</h1>"
         f"<p>Date: {data['date']} | Time: {data['time']} {data['timezone']}</p>"
         f"<p>{data['symbol']} | BINANCE SPOT DATA | PAPER ONLY | Minimum score {MIN_SCORE}/100</p>"
         f"<p>Status: {data['status']} | Price: {data['price']} | Source: {data.get('price_source', 'UNKNOWN')} | Bias: {data['bias']}</p>"
@@ -1327,7 +1327,11 @@ def home():
 @app.route("/health")
 def health():
     latest.update(current_clock())
-    return jsonify({"ok": True, "bot": "KCOMS V8.1", "status": latest["status"], **current_clock()}), 200
+    engine_alive = bool(_engine_thread and _engine_thread.is_alive())
+    return jsonify({
+        "ok": True, "bot": "KCOMS V8.2", "status": latest["status"],
+        "engine_thread_alive": engine_alive, **current_clock()
+    }), 200
 
 
 @app.route("/status")
@@ -1358,24 +1362,40 @@ def status():
                         "side_diagnostics": latest.get("side_diagnostics", {})})
 
 
-# ----------------------------- Render service roles -----------------------------
-# Deploy two Render services from this same repository:
-#   Web Service: KCOMS_ROLE=web, Start: gunicorn bot:app --workers 1 --threads 4
-#   Background Worker: KCOMS_ROLE=worker, Start: python bot.py
-# The web process never starts trading threads. Only the background worker runs
-# the scanner, Binance websocket and Telegram polling loop.
-KCOMS_ROLE = os.getenv("KCOMS_ROLE", "web").strip().lower()
+# ----------------------- Single-service Render Free mode -----------------------
+# One Render Web Service hosts BOTH Flask and the trading engine.
+# Use exactly ONE Gunicorn worker: multiple workers would duplicate the bot.
+# KCOMS_ROLE=web is accepted for compatibility with the previous V8.1 service.
+KCOMS_ROLE = os.getenv("KCOMS_ROLE", "combined").strip().lower()
+_engine_start_lock = threading.Lock()
+_engine_thread = None
 
-if KCOMS_ROLE == "worker":
+def start_embedded_engine_once() -> None:
+    """Start one scanner thread inside the single Gunicorn web worker."""
+    global _engine_thread
+    with _engine_start_lock:
+        if _engine_thread is not None and _engine_thread.is_alive():
+            return
+        _engine_thread = threading.Thread(
+            target=run_bot, daemon=True, name="kcoms-trading-engine"
+        )
+        _engine_thread.start()
+        log.info("KCOMS V8.2 embedded trading engine thread started")
+
+if KCOMS_ROLE in ("combined", "web"):
+    # Gunicorn imports this module in its sole worker process. The engine and
+    # Flask therefore share the same process and in-memory status.
+    start_embedded_engine_once()
+elif KCOMS_ROLE == "worker":
+    # Retained only for manual/local use; do not create a Render Background Worker
+    # for the free single-service deployment.
     if __name__ == "__main__":
-        log.info("Starting KCOMS V8.1 background trading worker")
+        log.info("Starting KCOMS V8.2 standalone trading worker")
         run_bot()
-elif KCOMS_ROLE == "web":
-    # Intentionally no trading-engine autostart in the Gunicorn web process.
-    pass
 else:
-    raise RuntimeError("KCOMS_ROLE must be either 'web' or 'worker'")
+    raise RuntimeError("KCOMS_ROLE must be 'combined', 'web', or 'worker'")
 
-if __name__ == "__main__" and KCOMS_ROLE == "web":
+if __name__ == "__main__" and KCOMS_ROLE in ("combined", "web"):
+    # Local fallback. Render should use the Gunicorn Start Command in README.txt.
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port, threaded=True)

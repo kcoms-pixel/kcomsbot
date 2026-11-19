@@ -14,7 +14,7 @@ Environment:
   MIN_NET_RR_AFTER_FEES=1.0
   PAPER_BALANCE=100
   PAPER_BALANCE_FILE=/tmp/kcoms_v7_balance.json
-  SCAN_INTERVAL=0.5
+  SCAN_INTERVAL=1
   COOLDOWN_MINUTES=2
   PRICE_STALE_SECONDS=5
   APPROVAL_TIMEOUT_SECONDS=120
@@ -42,7 +42,7 @@ from PIL import Image, ImageDraw, ImageFont
 app = Flask(__name__)
 SYMBOL = os.getenv("SYMBOL", "BTCUSDT").upper()
 MIN_SCORE = int(os.getenv("MIN_SCORE", "70"))
-SCAN_INTERVAL = max(1, int(os.getenv("SCAN_INTERVAL", "0.5")))
+SCAN_INTERVAL = max(1, int(os.getenv("SCAN_INTERVAL", "1")))
 LOG_INTERVAL_SECONDS = max(0.5, float(os.getenv("LOG_INTERVAL_SECONDS", "0.5")))
 MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "15"))
 COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "2"))

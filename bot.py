@@ -8,13 +8,13 @@ Dependencies: pip install -r requirements.txt
 Environment:
   8809310387:AAGY79kOhNPUULKpcxRuRscG6MgZ7icZuJ8, 498798769 (optional)
   SYMBOL=BTCUSDT
-  MIN_SCORE=60
+  MIN_SCORE=70
   TRADE_SIZE_USDT=5 (legacy alias for MAX_NOTIONAL_USDT)
   MAX_NOTIONAL_USDT=5
   MIN_NET_RR_AFTER_FEES=1.0
   PAPER_BALANCE=100
   PAPER_BALANCE_FILE=/tmp/kcoms_v7_balance.json
-  SCAN_INTERVAL=1
+  SCAN_INTERVAL=0.5
   COOLDOWN_MINUTES=2
   PRICE_STALE_SECONDS=5
   APPROVAL_TIMEOUT_SECONDS=120
@@ -41,8 +41,8 @@ from PIL import Image, ImageDraw, ImageFont
 # ----------------------------- Configuration -----------------------------
 app = Flask(__name__)
 SYMBOL = os.getenv("SYMBOL", "BTCUSDT").upper()
-MIN_SCORE = int(os.getenv("MIN_SCORE", "60"))
-SCAN_INTERVAL = max(1, int(os.getenv("SCAN_INTERVAL", "1")))
+MIN_SCORE = int(os.getenv("MIN_SCORE", "70"))
+SCAN_INTERVAL = max(1, int(os.getenv("SCAN_INTERVAL", "0.5")))
 LOG_INTERVAL_SECONDS = max(0.5, float(os.getenv("LOG_INTERVAL_SECONDS", "0.5")))
 MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "15"))
 COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "2"))
@@ -54,8 +54,8 @@ MAX_NOTIONAL_USDT = float(os.getenv("MAX_NOTIONAL_USDT", os.getenv("TRADE_SIZE_U
 MAX_ENTRY_EXTENSION_ATR = float(os.getenv("MAX_ENTRY_EXTENSION_ATR", "1.2"))  # avoid chasing price too far from 1m EMA20
 PAPER_BALANCE_FILE = os.getenv("PAPER_BALANCE_FILE", "/tmp/kcoms_v7_balance.json")
 PAPER_START_BALANCE = float(os.getenv("PAPER_BALANCE", "100"))
-TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
+TG_TOKEN = os.getenv("8809310387:AAGY79kOhNPUULKpcxRuRscG6MgZ7icZuJ8", "")
+TG_CHAT = os.getenv("498798769", "")
 TG_APPROVER_ID = os.getenv("TELEGRAM_APPROVER_ID", TG_CHAT)
 TRADE_ENABLED = os.getenv("TRADE_ENABLED", "false").lower() == "true"
 PAPER_FEE_RATE = float(os.getenv("PAPER_FEE_RATE", "0.001"))  # estimated fee per side

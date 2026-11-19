@@ -43,7 +43,7 @@ app = Flask(__name__)
 SYMBOL = os.getenv("SYMBOL", "BTCUSDT").upper()
 MIN_SCORE = int(os.getenv("MIN_SCORE", "60"))
 SCAN_INTERVAL = max(1, int(os.getenv("SCAN_INTERVAL", "1")))
-LOG_INTERVAL_SECONDS = max(1, int(os.getenv("LOG_INTERVAL_SECONDS", "2")))
+LOG_INTERVAL_SECONDS = max(0.5, float(os.getenv("LOG_INTERVAL_SECONDS", "0.5")))
 MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "15"))
 COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "2"))
 RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.1"))  # percent of paper equity
@@ -371,7 +371,7 @@ def _telegram_callback_worker() -> None:
                 log.error(
                     "Telegram getUpdates conflict (409). Check that this bot token "
                     "is not polling from another process and that no webhook is active. "
-                    "Retrying in %ss.", delay, delay
+                    "Retrying in %ss.", delay
                 )
             else:
                 log.warning("Telegram approval polling HTTP error (%s): %s; retrying in %ss",
@@ -1112,7 +1112,7 @@ def monitor_paper_position(price: float) -> None:
                    "balance": round(state["balance"], 2)})
 
 # ----------------------------- Console monitoring -----------------------------
-def log_live_status(price: Optional[float], force: bool = False) -> None:
+def log_live_status(price: Optional[float], force: bool = False, refresh_ema: bool = True) -> None:
     """Print the compact V6.7-style status line requested for Render logs."""
     now = time.time()
     if not force and now - float(state.get("last_status_log", 0.0)) < LOG_INTERVAL_SECONDS:
@@ -1122,7 +1122,7 @@ def log_live_status(price: Optional[float], force: bool = False) -> None:
 
     # Use the 200-period EMA from completed Binance Spot 15m candles.
     ema_value = float(latest.get("ema") or 0.0)
-    if ema_value <= 0:
+    if ema_value <= 0 and refresh_ema:
         candles = get_klines("15m", 250)
         if candles:
             closed = closed_candles(candles)
@@ -1163,12 +1163,51 @@ def log_live_status(price: Optional[float], force: bool = False) -> None:
     )
 
 
+# ----------------------------- Price display heartbeat -----------------------------
+_price_heartbeat_thread = None
+_price_heartbeat_start_lock = threading.Lock()
+_price_heartbeat_stop = threading.Event()
+
+
+def _price_display_heartbeat() -> None:
+    """Refresh the Render price display every 0.5s from cached WebSocket data.
+
+    This thread never calls Binance REST and does not run market analysis or
+    alter trade decisions. It only prints the most recently received price.
+    """
+    while not _price_heartbeat_stop.wait(0.5):
+        try:
+            with price_lock:
+                price = price_feed.get("price")
+            if price is None:
+                price = latest.get("price")
+            log_live_status(price, refresh_ema=False)
+        except Exception:
+            log.exception("Price display heartbeat error")
+
+
+def start_price_display_heartbeat_once() -> None:
+    global _price_heartbeat_thread
+    with _price_heartbeat_start_lock:
+        if _price_heartbeat_thread is not None and _price_heartbeat_thread.is_alive():
+            return
+        _price_heartbeat_stop.clear()
+        _price_heartbeat_thread = threading.Thread(
+            target=_price_display_heartbeat,
+            daemon=True,
+            name="kcoms-price-display-500ms",
+        )
+        _price_heartbeat_thread.start()
+        log.info("Price display heartbeat started: 0.5s (cached WebSocket price; no extra REST polling)")
+
+
 # ----------------------------- Main loop -----------------------------
 def run_bot() -> None:
     load_state()
     start_telegram_worker_once()
     start_telegram_approval_worker_once()
     start_price_websocket_once()
+    start_price_display_heartbeat_once()
     latest.update({"status": "SCANNING", "balance": round(state["balance"], 2)})
     log.info("KCOMS V8.2 started: %s; LONG+SHORT; minimum score %s; risk %.3f%%; gross RR 1:%.2f; max notional $%.2f; fee/side %.3f%%; minimum net RR %.2f; daily trade limit %s; cooldown %sm; max entry extension %.2f ATR; Telegram manual approval required; approval timeout %ss",
              SYMBOL, MIN_SCORE, RISK_PERCENT, RR_TARGET, MAX_NOTIONAL_USDT,

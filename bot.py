@@ -6,7 +6,7 @@ execution/risk module has been added.
 
 Dependencies: pip install -r requirements.txt
 Environment:
-  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID (optional)
+  8809310387:AAGY79kOhNPUULKpcxRuRscG6MgZ7icZuJ8, 498798769 (optional)
   SYMBOL=BTCUSDT
   MIN_SCORE=60
   TRADE_SIZE_USDT=5 (legacy alias for MAX_NOTIONAL_USDT)

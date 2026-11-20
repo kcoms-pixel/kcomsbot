@@ -17,8 +17,6 @@ Environment:
   SCAN_INTERVAL=1
   COOLDOWN_MINUTES=2
   PRICE_STALE_SECONDS=5
-  APPROVAL_TIMEOUT_SECONDS=120
-  APPROVAL_MAX_DRIFT_ATR=0.25
   TRADE_ENABLED=false (true is rejected intentionally in this build)
 """
 
@@ -29,14 +27,11 @@ import os
 import threading
 import time
 import queue
-import io
-import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 
 import requests
 from flask import Flask, jsonify
-from PIL import Image, ImageDraw, ImageFont
 
 # ----------------------------- Configuration -----------------------------
 app = Flask(__name__)
@@ -54,15 +49,12 @@ MAX_NOTIONAL_USDT = float(os.getenv("MAX_NOTIONAL_USDT", os.getenv("TRADE_SIZE_U
 MAX_ENTRY_EXTENSION_ATR = float(os.getenv("MAX_ENTRY_EXTENSION_ATR", "1.2"))  # avoid chasing price too far from 1m EMA20
 PAPER_BALANCE_FILE = os.getenv("PAPER_BALANCE_FILE", "/tmp/kcoms_v7_balance.json")
 PAPER_START_BALANCE = float(os.getenv("PAPER_BALANCE", "100"))
-TG_TOKEN = os.getenv("8809310387:AAGY79kOhNPUULKpcxRuRscG6MgZ7icZuJ8", "")
-TG_CHAT = os.getenv("498798769", "")
-TG_APPROVER_ID = os.getenv("TELEGRAM_APPROVER_ID", TG_CHAT)
+TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 TRADE_ENABLED = os.getenv("TRADE_ENABLED", "false").lower() == "true"
 PAPER_FEE_RATE = float(os.getenv("PAPER_FEE_RATE", "0.001"))  # estimated fee per side
 MIN_NET_RR_AFTER_FEES = float(os.getenv("MIN_NET_RR_AFTER_FEES", "1.0"))
 PRICE_STALE_SECONDS = max(2, int(os.getenv("PRICE_STALE_SECONDS", "5")))
-APPROVAL_TIMEOUT_SECONDS = max(30, int(os.getenv("APPROVAL_TIMEOUT_SECONDS", "120")))
-APPROVAL_MAX_DRIFT_ATR = max(0.05, float(os.getenv("APPROVAL_MAX_DRIFT_ATR", "0.25")))
 REST_CONNECT_TIMEOUT = max(0.5, float(os.getenv("REST_CONNECT_TIMEOUT", "1.5")))
 REST_READ_TIMEOUT = max(1.0, float(os.getenv("REST_READ_TIMEOUT", "2.5")))
 # Signal freshness windows: lower-timeframe confirmation may arrive after structure forms.
@@ -158,8 +150,6 @@ state = {
     "rejection_counts": {},
     "recent_rejections": [],
     "trade_history": [],
-    "pending_approval": None,
-    "last_proposal_key": None,
 }
 
 # Cached candles avoid requesting five full histories every second.
@@ -209,198 +199,6 @@ def send_tg(message: str) -> None:
         except queue.Empty:
             pass
 
-
-def _chart_image(candles: List[dict], proposal: dict) -> io.BytesIO:
-    """Render a compact candlestick screenshot with proposed entry, SL and TP."""
-    width, height = 1200, 760
-    img = Image.new("RGB", (width, height), "#101820")
-    d = ImageDraw.Draw(img)
-    try:
-        font_title = ImageFont.truetype("DejaVuSans-Bold.ttf", 34)
-        font = ImageFont.truetype("DejaVuSans.ttf", 22)
-        font_small = ImageFont.truetype("DejaVuSans.ttf", 17)
-    except OSError:
-        font_title = font = font_small = ImageFont.load_default()
-    d.text((35, 24), f"KCOMS V8.2  |  {SYMBOL}  |  {proposal['direction']} SETUP", fill="#FFFFFF", font=font_title)
-    d.text((38, 76), f"Score {proposal['score']}/100   •   {current_clock()['date']} {current_clock()['time']} EAT", fill="#B8C7D1", font=font)
-    plot = (80, 145, 1120, 610)
-    left, top, right, bottom = plot
-    d.rectangle(plot, outline="#536471", width=2)
-    candles = candles[-65:]
-    lows = [float(c['l']) for c in candles]
-    highs = [float(c['h']) for c in candles]
-    levels = [float(proposal['price']), float(proposal['stop']), float(proposal['target'])]
-    lo, hi = min(lows + levels), max(highs + levels)
-    pad = max((hi-lo)*0.08, 1.0); lo -= pad; hi += pad
-    def y(v): return int(bottom - (v-lo)/(hi-lo)*(bottom-top))
-    for i in range(5):
-        yy = top + i*(bottom-top)//4
-        d.line((left, yy, right, yy), fill="#263744", width=1)
-        val = hi - i*(hi-lo)/4
-        d.text((left+5, yy+3), f"{val:,.1f}", fill="#8295A3", font=font_small)
-    step = (right-left)/max(len(candles),1)
-    body_w = max(5, int(step*0.56))
-    for i,c in enumerate(candles):
-        x = int(left + (i+0.5)*step)
-        yo, yc, yh, yl = y(c['o']), y(c['c']), y(c['h']), y(c['l'])
-        up = c['c'] >= c['o']; color = "#26C281" if up else "#F05B64"
-        d.line((x,yh,x,yl), fill=color, width=2)
-        d.rectangle((x-body_w//2,min(yo,yc),x+body_w//2,max(yo,yc)), fill=color)
-    def level(value, color, label):
-        yy=y(value); d.line((left,yy,right,yy), fill=color, width=3)
-        d.rounded_rectangle((right-275,yy-17,right-8,yy+17), radius=7, fill=color)
-        d.text((right-265,yy-13), f"{label}: {value:,.2f}", fill="#101820", font=font_small)
-    level(proposal['target'], "#26C281", "TAKE PROFIT")
-    level(proposal['price'], "#55A7FF", "ENTRY")
-    level(proposal['stop'], "#F05B64", "STOP LOSS")
-    d.text((85, 635), f"Trigger: {proposal.get('entry_trigger','N/A')}   |   Regime: {proposal.get('regime','N/A')}   |   30m bias: {proposal.get('bias_30m','N/A')}   |   1h bias: {proposal.get('bias_1h','N/A')}", fill="#D4DEE5", font=font_small)
-    reasons = "; ".join(proposal.get('reasons', [])[:3])
-    d.text((85, 675), reasons[:115], fill="#B8C7D1", font=font_small)
-    d.text((85, 715), "PAPER TRADE PROPOSAL — approval required; no order has been opened", fill="#F5C451", font=font_small)
-    out=io.BytesIO(); img.save(out, format="PNG"); out.seek(0); return out
-
-
-def _telegram_api(method: str, **kwargs):
-    if not TG_TOKEN or not TG_CHAT:
-        return None
-    response = SESSION.post(f"https://api.telegram.org/bot{TG_TOKEN}/{method}", timeout=(3, 8), **kwargs)
-    response.raise_for_status()
-    data=response.json()
-    if not data.get("ok"):
-        raise RuntimeError(f"Telegram API {method} failed: {data}")
-    return data.get("result")
-
-
-def send_trade_proposal(proposal: dict) -> None:
-    """Send chart and inline approval controls; proposal remains pending until callback."""
-    if not TG_TOKEN or not TG_CHAT:
-        log.warning("Trade proposal not sent: Telegram credentials are not configured")
-        return
-    proposal_id = uuid.uuid4().hex[:10]
-    pending = {**proposal, "id": proposal_id, "created_at": time.time(),
-               "expires_at": time.time()+APPROVAL_TIMEOUT_SECONDS, "decision": "PENDING"}
-    state["pending_approval"] = pending
-    state["last_proposal_key"] = (proposal.get("candle_key"), proposal.get("direction"))
-    markup = {"inline_keyboard": [[
-        {"text": "✅ APPROVE PAPER TRADE", "callback_data": f"kcoms:approve:{proposal_id}"},
-        {"text": "❌ REJECT", "callback_data": f"kcoms:reject:{proposal_id}"}
-    ]]}
-    caption = (
-        f"⚠️ KCOMS V8.2 — TRADE PROPOSAL\n{SYMBOL} {proposal['direction']}\n"
-        f"Entry: {proposal['price']:.2f}\nSL: {proposal['stop']:.2f}\nTP: {proposal['target']:.2f}\n"
-        f"Score: {proposal['score']}/100 | Net RR after fees: {proposal.get('net_rr_after_fees',0):.2f}\n"
-        f"Trigger: {proposal.get('entry_trigger','N/A')}\n"
-        f"Expires in {APPROVAL_TIMEOUT_SECONDS}s. No trade is open yet."
-    )
-    try:
-        photo = _chart_image(proposal.get("chart_candles", []), proposal)
-        _telegram_api("sendPhoto", data={"chat_id": TG_CHAT, "caption": caption,
-                                          "reply_markup": json.dumps(markup)},
-                      files={"photo": (f"{SYMBOL}_{proposal_id}.png", photo, "image/png")})
-        log.info("TRADE PROPOSAL SENT | %s %s | id=%s", SYMBOL, proposal['direction'], proposal_id)
-    except Exception as exc:
-        state["pending_approval"] = None
-        log.exception("Could not send Telegram trade proposal: %s", exc)
-
-
-def _telegram_callback_worker() -> None:
-    """Single long-poll loop with retry/backoff; only the configured chat can decide."""
-    offset = None
-    failures = 0
-    # Polling and webhooks are mutually exclusive in Telegram. Clear a stale webhook
-    # before polling; do not drop queued updates.
-    try:
-        _telegram_api("deleteWebhook", data={"drop_pending_updates": "false"})
-        log.info("Telegram webhook cleared; approval polling mode enabled")
-    except Exception as exc:
-        log.warning("Could not clear Telegram webhook before polling: %s", exc)
-    while True:
-        try:
-            params = {"timeout": 25, "allowed_updates": json.dumps(["callback_query"])}
-            if offset is not None: params["offset"] = offset
-            response = SESSION.get(
-                f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates",
-                params=params, timeout=(8, 40)
-            )
-            response.raise_for_status()
-            payload=response.json()
-            failures = 0
-            for update in payload.get("result", []):
-                offset = int(update["update_id"])+1
-                cb=update.get("callback_query") or {}
-                data=str(cb.get("data", "")); message=cb.get("message") or {}
-                chat_id=str((message.get("chat") or {}).get("id", ""))
-                from_id = str((cb.get("from") or {}).get("id", ""))
-                if chat_id != str(TG_CHAT) or from_id != str(TG_APPROVER_ID):
-                    if cb.get("id"):
-                        _telegram_api("answerCallbackQuery", data={"callback_query_id":cb["id"],"text":"Not authorised."})
-                    continue
-                parts=data.split(":")
-                if len(parts)!=3 or parts[0]!="kcoms" or parts[1] not in ("approve","reject"):
-                    continue
-                with lock:
-                    pending=state.get("pending_approval")
-                    if not pending or pending.get("id") != parts[2] or pending.get("decision") != "PENDING":
-                        pending_status = "inactive"
-                    elif time.time() > float(pending["expires_at"]):
-                        pending["decision"]="EXPIRED"
-                        pending_status = "expired"
-                    else:
-                        pending["decision"]="APPROVED" if parts[1]=="approve" else "REJECTED"
-                        pending_status = "accepted"
-                if pending_status == "inactive":
-                    _telegram_api("answerCallbackQuery", data={"callback_query_id":cb["id"],"text":"This proposal is no longer active."})
-                    continue
-                if pending_status == "expired":
-                    _telegram_api("answerCallbackQuery", data={"callback_query_id":cb["id"],"text":"Approval expired."})
-                    continue
-                who=(cb.get("from") or {}).get("first_name", "Authorised user")
-                _telegram_api("answerCallbackQuery", data={"callback_query_id":cb["id"],"text":pending["decision"].title()})
-                _telegram_api("editMessageCaption", data={"chat_id":TG_CHAT,"message_id":message.get("message_id"),
-                    "caption":(message.get("caption","")+f"\n\n{ '✅ APPROVED — awaiting final price/setup validation' if parts[1]=='approve' else '❌ REJECTED — no trade opened' }")[:1024],
-                    "reply_markup":json.dumps({"inline_keyboard":[]})})
-                log.info("TRADE PROPOSAL %s by %s | id=%s", pending["decision"], who, pending["id"])
-                if parts[1]=="reject":
-                    with lock:
-                        state["pending_approval"]=None
-        except requests.HTTPError as exc:
-            failures += 1
-            status = getattr(getattr(exc, "response", None), "status_code", None)
-            delay = min(60, 3 * (2 ** min(failures - 1, 4)))
-            if status == 409:
-                log.error(
-                    "Telegram getUpdates conflict (409). Check that this bot token "
-                    "is not polling from another process and that no webhook is active. "
-                    "Retrying in %ss.", delay
-                )
-            else:
-                log.warning("Telegram approval polling HTTP error (%s): %s; retrying in %ss",
-                            status, exc, delay)
-            time.sleep(delay)
-        except (requests.RequestException, ValueError, RuntimeError) as exc:
-            failures += 1
-            delay = min(60, 2 * (2 ** min(failures - 1, 5)))
-            log.warning("Telegram approval polling error: %s; retrying in %ss", exc, delay)
-            time.sleep(delay)
-        except Exception as exc:
-            failures += 1
-            delay = min(60, 2 * (2 ** min(failures - 1, 5)))
-            log.exception("Unexpected Telegram approval polling error; retrying in %ss", delay)
-            time.sleep(delay)
-
-
-_approval_start_lock = threading.Lock()
-
-def start_telegram_approval_worker_once() -> None:
-    if not TG_TOKEN or not TG_CHAT:
-        return
-    with _approval_start_lock:
-        if getattr(start_telegram_approval_worker_once, "started", False):
-            return
-        start_telegram_approval_worker_once.started = True
-        threading.Thread(
-            target=_telegram_callback_worker, daemon=True, name="telegram-approvals"
-        ).start()
 
 # ----------------------------- Market data -----------------------------
 def _record_price(value: float, source: str) -> None:
@@ -1044,7 +842,7 @@ def open_paper_position(signal: dict) -> None:
     state["trades_today"] += 1
     save_state()
     msg = (
-        f"🟢 KCOMS V8.2 PAPER {signal['direction']} {SYMBOL}\nDate: {current_clock()['date']} EAT\n"
+        f"🟢 KCOMS V8.2 PAPER TRADE ENTERED — {signal['direction']} {SYMBOL}\nDate: {current_clock()['date']} EAT\n"
         f"Entry: {signal['price']:.2f}\nSL: {signal['stop']:.2f}\n"
         f"TP: {signal['target']:.2f}\nScore: {signal['score']}/100\n"
         f"Risk: ${risk_cash:.2f} | Notional: ${notional:.2f}\n"
@@ -1097,8 +895,9 @@ def monitor_paper_position(price: float) -> None:
     })
     state["trade_history"] = state["trade_history"][-100:]
     msg = (
-        f"{'✅' if pnl > 0 else '❌'} KCOMS V8.2 PAPER {result} {side}\nDate: {current_clock()['date']} EAT\n"
-        f"Exit: {exit_price:.2f}\nNet P/L: ${pnl:.4f} (estimated fees included)\n"
+        f"{'✅' if pnl > 0 else '❌'} KCOMS V8.2 PAPER {result} — {side} {SYMBOL}\n"
+        f"Exit reason: {'TAKE PROFIT' if target_hit else 'STOP LOSS'}\nDate: {current_clock()['date']} EAT\n"
+        f"Entry: {float(pos['entry']):.2f} | Exit: {exit_price:.2f}\nNet P/L: ${pnl:.4f} (estimated fees included)\n"
         f"Paper balance: ${state['balance']:.2f}\n"
         f"W:{state['wins']} L:{state['losses']}"
     )
@@ -1205,14 +1004,15 @@ def start_price_display_heartbeat_once() -> None:
 def run_bot() -> None:
     load_state()
     start_telegram_worker_once()
-    start_telegram_approval_worker_once()
+    if not TG_TOKEN or not TG_CHAT:
+        log.warning("Telegram alerts disabled: TELEGRAM_BOT_TOKEN and/or TELEGRAM_CHAT_ID missing")
     start_price_websocket_once()
     start_price_display_heartbeat_once()
     latest.update({"status": "SCANNING", "balance": round(state["balance"], 2)})
-    log.info("KCOMS V8.2 started: %s; LONG+SHORT; minimum score %s; risk %.3f%%; gross RR 1:%.2f; max notional $%.2f; fee/side %.3f%%; minimum net RR %.2f; daily trade limit %s; cooldown %sm; max entry extension %.2f ATR; Telegram manual approval required; approval timeout %ss",
+    log.info("KCOMS V8.2 AUTO PAPER MODE started: %s; LONG+SHORT; minimum score %s; risk %.3f%%; gross RR 1:%.2f; max notional $%.2f; fee/side %.3f%%; minimum net RR %.2f; daily trade limit %s; cooldown %sm; max entry extension %.2f ATR; Telegram trade-event alerts only",
              SYMBOL, MIN_SCORE, RISK_PERCENT, RR_TARGET, MAX_NOTIONAL_USDT,
              PAPER_FEE_RATE * 100, MIN_NET_RR_AFTER_FEES,
-             MAX_TRADES_PER_DAY, COOLDOWN_MINUTES, MAX_ENTRY_EXTENSION_ATR, APPROVAL_TIMEOUT_SECONDS)
+             MAX_TRADES_PER_DAY, COOLDOWN_MINUTES, MAX_ENTRY_EXTENSION_ATR)
     log_live_status(None, force=True)
 
     while True:
@@ -1278,53 +1078,17 @@ def run_bot() -> None:
                     "balance": round(state["balance"], 2), "last_error": "",
                 })
 
-                # Alert only once per completed 1m candle to avoid Telegram spam.
-                alert_key = (analysis["candle_key"], analysis["direction"], analysis["score"])
-
-                pending = state.get("pending_approval")
-                if pending and pending.get("decision") == "PENDING" and time.time() > float(pending.get("expires_at", 0)):
-                    pending["decision"] = "EXPIRED"
-                    state["pending_approval"] = None
-                    log.info("TRADE PROPOSAL EXPIRED | id=%s", pending.get("id"))
-                elif pending and pending.get("decision") == "APPROVED":
-                    drift = abs(float(price) - float(pending["price"]))
-                    max_drift = max(float(analysis.get("atr_1m") or 0) * APPROVAL_MAX_DRIFT_ATR, 0.01)
-                    still_valid = (analysis["confirmed"] and analysis["direction"] == pending["direction"]
-                                   and drift <= max_drift and state["position"] is None
-                                   and state["trades_today"] < MAX_TRADES_PER_DAY
-                                   and time.time() >= float(state["cooldown_until"]))
-                    if still_valid:
-                        # Shift levels with the live entry so the approved risk distance is retained.
-                        adjusted = dict(pending)
-                        delta = float(price) - float(pending["price"])
-                        adjusted["price"] = float(price)
-                        adjusted["stop"] = float(pending["stop"]) + delta
-                        adjusted["target"] = float(pending["target"]) + delta
-                        adjusted["risk_distance"] = abs(adjusted["price"] - adjusted["stop"])
-                        adjusted["net_rr_after_fees"] = net_reward_risk_after_fees(
-                            adjusted["direction"], adjusted["price"], adjusted["stop"],
-                            adjusted["target"], PAPER_FEE_RATE)
-                        if adjusted["net_rr_after_fees"] >= MIN_NET_RR_AFTER_FEES:
-                            state["last_trade_key"] = analysis["candle_key"]
-                            open_paper_position(adjusted)
-                        else:
-                            send_tg("⚠️ KCOMS: Approved setup cancelled — fee-adjusted reward/risk fell below the minimum.")
-                    else:
-                        send_tg("⚠️ KCOMS: Approved setup cancelled — price moved too far or the setup is no longer valid. No trade opened.")
-                    state["pending_approval"] = None
-                can_propose = (
+                # Automatically open paper trades when the existing strategy confirms.
+                can_enter = (
                     analysis["confirmed"] and state["position"] is None
-                    and state.get("pending_approval") is None
                     and state["trades_today"] < MAX_TRADES_PER_DAY
                     and time.time() >= float(state["cooldown_until"])
                     and state["last_trade_key"] != analysis["candle_key"]
-                    and state.get("last_proposal_key") != (analysis["candle_key"], analysis["direction"])
                 )
-                if can_propose:
-                    send_trade_proposal(analysis)
-                    latest["status"] = "AWAITING_APPROVAL"
-                latest["status"] = ("IN_POSITION" if state["position"] else
-                                     "AWAITING_APPROVAL" if state.get("pending_approval") else "SCANNING")
+                if can_enter:
+                    state["last_trade_key"] = analysis["candle_key"]
+                    open_paper_position(analysis)
+                latest["status"] = "IN_POSITION" if state["position"] else "SCANNING"
                 latest["wins"] = state["wins"]
                 latest["losses"] = state["losses"]
                 latest["trades_today"] = state["trades_today"]
@@ -1357,7 +1121,7 @@ def home():
         f"<p>Paper balance: ${data['balance']} | Completed: {data.get('completed_trades', data['wins'] + data['losses'])} "
         f"| Wins: {data['wins']} | Losses: {data['losses']} "
         f"| Today: {data['trades_today']}/{MAX_TRADES_PER_DAY}</p>"
-        f"<p>Pending approval: {state.get('pending_approval', {}).get('decision', 'NO') if state.get('pending_approval') else 'NO'} | Open position: {'YES' if state['position'] else 'NO'} | Log heartbeat: every {LOG_INTERVAL_SECONDS}s</p>"
+        "<p>Execution: AUTOMATIC PAPER</p>"
         f"<p>Trade details: {('SIDE ' + str(state['position']['side']) + ' | ENTRY ' + format(float(state['position']['entry']), '.2f') + ' | SL ' + format(float(state['position']['stop']), '.2f') + ' | TP ' + format(float(state['position']['target']), '.2f')) if state['position'] else ('COOLING: ' + str(max(0, int(float(state['cooldown_until']) - time.time()))) + ' seconds remaining' if float(state['cooldown_until']) > time.time() else 'No open trade / not cooling')}</p>"
         f"<p>Last: {data['last_signal']}</p>"
     )
@@ -1381,7 +1145,6 @@ def status():
         return jsonify({**latest, "completed_trades": completed,
                         "win_rate_percent": round(100.0 * state["wins"] / completed, 2) if completed else 0.0,
                         "open_position": state["position"] is not None,
-                        "pending_approval": ({"id": state["pending_approval"].get("id"), "side": state["pending_approval"].get("direction"), "score": state["pending_approval"].get("score"), "decision": state["pending_approval"].get("decision"), "expires_at": state["pending_approval"].get("expires_at")} if state.get("pending_approval") else None),
                         "position": state["position"],
                         "trades_today_limit": MAX_TRADES_PER_DAY,
                         "cooldown_active": time.time() < float(state["cooldown_until"]),
